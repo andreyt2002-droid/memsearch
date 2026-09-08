@@ -70,13 +70,15 @@ These are NOT in the MemSearch TOML. They live in the profile patch under the
     injectEnabled: true      # inject returned memory candidates
     summarizeEnabled: true   # summarize turns before writing
     summarizeMode: auto      # auto | dsh-headless | custom-llm
+    summarizeProfile: headless # DSH application profile for dsh-headless
 ```
 
 ## Summarizer backends
 
 - **`auto`** (default) — if `[plugins.dsh.summarize] provider` is set, uses
   `custom-llm`; otherwise `dsh-headless`.
-- **`dsh-headless`** — boots a one-shot `dsh --profile headless` agent. The
+- **`dsh-headless`** — boots a one-shot `dsh --profile <summarizeProfile>` agent (`headless` by default). The
+  selected profile controls the sub-agent's model; a dedicated profile can isolate a cheaper summary model from the interactive agent. Without that isolation, the
   sub-agent's model is the deployment's `agent-default-model` from
   `~/.dsh/settings.yaml` (`%USERPROFILE%\.dsh\settings.yaml` on Windows) (the same selection the Web UI model picker writes).
   **`[plugins.dsh.summarize]` provider/model do NOT apply here** — change the
@@ -90,8 +92,8 @@ dump.
 
 ## Native model defaults
 
-- `dsh-headless` and `native` maintenance use the DSH deployment's
-  `agent-default-model` (Web UI model picker / `~/.dsh/settings.yaml`, or `%USERPROFILE%\.dsh\settings.yaml` on Windows).
+- `dsh-headless` uses the selected `summarizeProfile` profile's effective `agent-default-model`. The default `headless` profile normally reads the Web UI selection from `~/.dsh/settings.yaml` (`%USERPROFILE%\.dsh\settings.yaml` on Windows); a dedicated profile can isolate another model.
+- `native` maintenance uses the DSH deployment's default model.
 
 ## Restart guidance
 

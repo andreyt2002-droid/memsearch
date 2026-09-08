@@ -97,6 +97,14 @@ When modifying hooks/skills, keep in mind:
 - The `memory-recall` skill uses `context: fork` — the subagent has its own context window and does not see main conversation history
 - `transcript.py` lives in the plugin directory (not in core library) since it is entirely Claude Code JSONL-specific
 
+### DeepSeek Harness Plugin (`plugins/dsh/`)
+
+The DSH plugin is a plain ESM bundle with no build step. It captures `turn/end` from `session/event`, reads the immutable log through `session.snapshotEvents()`, writes the shared anchored markdown format, indexes each write, injects search results at `agent/pre-step`, and registers native memory skills. The browser half adds the read-only memory and skill-candidate dock to Web profiles.
+
+Run `node --test tests/*.test.js` from `plugins/dsh/` after each plugin change. A linked source install requires a DSH profile restart before production verification. Complete one Web turn, confirm the new markdown anchor and summary, then search the resolved collection. Child DSH processes must receive EOF on stdin and set `MEMSEARCH_DSH_SUMMARIZE=1` so the plugin stays inert inside summarization.
+
+See `plugins/dsh/README.md` for configuration and `docs/platforms/dsh/how-it-works.md` for lifecycle behavior.
+
 ## Key Design Decisions
 
 - **Markdown is the source of truth.** Milvus is a derived index, rebuildable anytime from `.md` files.

@@ -67,6 +67,7 @@ The plugin works without configuration. Its DSH profile settings control lifecyc
 | `injectEnabled` | `true` | Search and inject returned memory candidates before the first model step |
 | `summarizeEnabled` | `true` | Summarize turns before writing them |
 | `summarizeMode` | `auto` | Use a configured API provider when present; otherwise use a one-shot DSH headless agent |
+| `summarizeProfile` | `headless` | Select the DSH application profile used by the headless backend |
 
 To override these settings, patch the `memsearch` row in the profile's `cordis.patch.yml`:
 
@@ -76,6 +77,7 @@ To override these settings, patch the `memsearch` row in the profile's `cordis.p
     captureEnabled: true
     injectEnabled: true
     summarizeMode: auto
+    summarizeProfile: headless
 ```
 
 Embedding, Milvus, and provider settings continue to live in the shared MemSearch configuration. For example, to route DSH capture summarization through a configured provider:

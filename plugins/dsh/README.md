@@ -101,6 +101,7 @@ block (patch the `memsearch` row you inserted). All keys are optional.
 | `injectEnabled` | bool | `true` | Inject returned memory candidates before each turn's first step. |
 | `summarizeEnabled` | bool | `true` | Summarize turns before writing (on failure a short unavailable note is written, never a raw dump). |
 | `summarizeMode` | string | `auto` | Summarizer backend. `auto` (default) mirrors the other platform plugins: if `[plugins.dsh.summarize] provider` is set in memsearch config, it uses `custom-llm`; otherwise `dsh-headless` (zero-config DSH agent). Explicit `dsh-headless` / `custom-llm` pin the backend. |
+| `summarizeProfile` | string | `headless` | DSH application profile started by the `dsh-headless` backend. Use a dedicated profile to isolate a cheaper summary model from the interactive agent. |
 
 Everything else — provider/model, Milvus, collection, memory dir — comes from
 **memsearch config / environment**, exactly like the other platform plugins
@@ -142,7 +143,8 @@ Example override layer (add this to the profile's own `cordis.patch.yml`):
 ```yaml
 - id: memsearch
   config:
-    summarizeMode: dsh-headless   # pin the headless backend (default is auto)
+    summarizeMode: dsh-headless       # pin the headless backend (default is auto)
+    summarizeProfile: memsearch-summary # isolate a dedicated summary model
 ```
 
 ### Summarization modes
@@ -161,7 +163,7 @@ a direct LLM call; configure nothing and you get a headless agent.
   This means the plugin behaves like the other four: **configure a provider
   → direct LLM; configure nothing → headless**.
 - **`dsh-headless`** — boots a one-shot DSH headless agent
-  (`dsh --profile headless "<summarize task>"`) to write the notes, mirroring
+  (`dsh --profile <summarizeProfile> "<summarize task>"`) to write the notes, mirroring
   how the other plugins reuse their own agent's headless mode. Zero-config for
   anyone already using DSH: the sub-agent's model is the deployment's
   `agent-default-model` — the user layer of `~/.dsh/settings.yaml` (the same

@@ -23,6 +23,8 @@
         #   injectEnabled (bool, default true)    — inject returned memory candidates
         #   summarizeEnabled (bool, default true) — summarize turns before writing
         #   summarizeMode (string, default 'auto')
+        #   summarizeProfile (string, default 'headless') — DSH profile used by
+        #                          the dsh-headless backend
         #       -> 'auto'         if [plugins.dsh.summarize] provider is set in
         #                          memsearch config → custom-llm, else
         #                          dsh-headless (zero-config)

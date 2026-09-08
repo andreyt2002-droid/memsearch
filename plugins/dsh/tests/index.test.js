@@ -476,7 +476,7 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
   const session = {
     id: 'session-raw-test',
     header: { cwd: projDir },
-    events: [
+    snapshotEvents: () => [
       { type: 'turn/start', data: { turn: 1 } },
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'remember raw-marker-001' }] } },
       { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
@@ -528,7 +528,7 @@ test('apply: summarize failure writes unavailable note (not raw)', async () => {
     const session = {
       id: 'session-fail-test',
       header: { cwd: projDir },
-      events: [
+      snapshotEvents: () => [
         { type: 'turn/start', data: { turn: 1 } },
         { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'secret raw content that must not leak' }] } },
         { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
@@ -580,7 +580,7 @@ test('apply: multi-project capture writes to each project memory dir', async () 
     const mkSession = (id, cwd, marker) => ({
       id,
       header: { cwd },
-      events: [
+      snapshotEvents: () => [
         { type: 'turn/start', data: { turn: 1 } },
         { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: marker }] } },
         { type: 'turn/end', data: { turn: 1 } },
@@ -655,13 +655,15 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   fs.writeFileSync(
     recorder,
     'import { writeFileSync } from "node:fs";\n' +
-    `writeFileSync(${JSON.stringify(argvFile)}, process.argv.slice(2).join("\\n"));\n`,
+    'process.stdin.resume();\n' +
+    `process.stdin.once("end", () => writeFileSync(${JSON.stringify(argvFile)}, process.argv.slice(2).join("\\n")));\n`,
     'utf-8',
   )
   try {
     process.env.DSH_CLI = `"${process.execPath}" "${recorder}"`
     const opts = {
       summarizeMode: 'dsh-headless',
+      summarizeProfile: 'memsearch-summary',
       agentName: 'X',
       summarizeProvider: 'deepseek-zilliz',
       summarizeModel: 'deepseek-v4-pro',
@@ -671,6 +673,7 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
     const summary = await summarizeTurn(ctx, opts, render, process.cwd())
     assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
     const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
+    assert.equal(recorded[recorded.indexOf('--profile') + 1], 'memsearch-summary', 'configured summary profile')
     assert.ok(
       !recorded.includes('--patch'),
       `headless summarize must not pass --patch; got argv: ${JSON.stringify(recorded)}`,
@@ -691,7 +694,7 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
 
 test('renderTurn: renders user/assistant/tool events into the shared format', () => {
   const session = {
-    events: [
+    snapshotEvents: () => [
       { type: 'turn/start', data: { turn: 7 } },
       { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'hello there' }] } },
       { type: 'tool/call', data: { name: 'bash' } },
@@ -708,7 +711,7 @@ test('renderTurn: renders user/assistant/tool events into the shared format', ()
 
 test('renderTurn: returns null when no user message', () => {
   const session = {
-    events: [
+    snapshotEvents: () => [
       { type: 'turn/start', data: { turn: 1 } },
       { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'only assistant' }] } } },
       { type: 'turn/end', data: { turn: 1 } },

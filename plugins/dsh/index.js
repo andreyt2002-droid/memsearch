@@ -823,7 +823,7 @@ function sessionLogPath(ctx, session) {
  */
 function renderTurn(session, turnEndEvent) {
   const turn = turnEndEvent.data.turn
-  const events = session.events
+  const events = session.snapshotEvents()
   const startIndex = events.findIndex(
     (event) => event.type === 'turn/start' && event.data.turn === turn,
   )
@@ -988,8 +988,8 @@ function detectDshCmd() {
 }
 
 /**
- * Summarize one rendered turn by booting a one-shot DSH headless agent
- * (`dsh --profile headless`), mirroring how the Claude Code / Codex / OpenCode
+ * Summarize one rendered turn by booting a one-shot DSH agent from the
+ * configured summary profile (`headless` by default), mirroring how the Claude Code / Codex / OpenCode
  * plugins reuse their own agent's headless mode with a small model.
  *
  * The headless profile is the same one the user already has; the plugin does
@@ -1025,11 +1025,12 @@ function summarizeHeadless(ctx, opts, render, projectDir) {
     }
     const task = `${systemPrompt}\n\nTranscript:\n${render}`
 
-    const args = ['--profile', 'headless', task]
+    const args = ['--profile', opts.summarizeProfile || 'headless', task]
 
     const child = spawn(dshCmd[0], [...dshCmd.slice(1), ...args], {
       cwd: projectDir,
       env: { ...process.env, MEMSEARCH_DSH_SUMMARIZE: '1' },
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
     let stderr = ''
@@ -1206,6 +1207,7 @@ export function apply(ctx, config = {}) {
     injectEnabled: config.injectEnabled !== false,
     summarizeEnabled: config.summarizeEnabled !== false,
     summarizeMode: config.summarizeMode,
+    summarizeProfile: config.summarizeProfile,
   }
 
   const memsearchCmd = detectMemsearchCmd()
