@@ -2,8 +2,8 @@
 
 A pure scorer for candidate memory sections: given the text a summarizer
 produced and the recent sections already written to the journal, compute a
-0–100 quality score and a capture action (``write`` / ``degrade`` /
-``reject``). No I/O, no shared state, no LLM — the caller owns the file
+0-100 quality score and a capture action (``write`` / ``degrade`` /
+``reject``). No I/O, no shared state, no LLM - the caller owns the file
 system and the journal, which keeps this module trivially testable and
 shareable across plugin capture paths via ``memsearch quality``.
 """
@@ -12,19 +12,20 @@ from __future__ import annotations
 
 import hashlib
 import re
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from typing import Iterable, Literal, Sequence
+from typing import Literal
 
 __all__ = [
-    "MIN_CONTENT_LENGTH_DEFAULT",
     "DEGRADE_THRESHOLD_DEFAULT",
+    "MIN_CONTENT_LENGTH_DEFAULT",
     "REJECT_THRESHOLD_DEFAULT",
-    "QualityVerdict",
     "QualityFilterSettings",
-    "score_section",
+    "QualityVerdict",
     "decide",
     "evaluate_section",
     "extract_sections",
+    "score_section",
 ]
 
 MIN_CONTENT_LENGTH_DEFAULT = 40
@@ -94,7 +95,9 @@ class QualityFilterSettings:
 
 
 def _normalize(text: str) -> str:
-    return _WHITESPACE_RE.sub(" ", text).strip()
+    # Drop lone surrogates that can arrive from platform pipes (e.g. Windows stdin).
+    cleaned = text.encode("utf-8", errors="ignore").decode("utf-8", errors="ignore")
+    return _WHITESPACE_RE.sub(" ", cleaned).strip()
 
 
 def _tokens(text: str) -> list[str]:
@@ -199,7 +202,7 @@ def evaluate_section(
     recent_sections: Sequence[str] | None = None,
     settings: QualityFilterSettings | None = None,
 ) -> QualityVerdict:
-    """Score and decide in one call — the main entry point for capture paths."""
+    """Score and decide in one call - the main entry point for capture paths."""
     cfg = settings or QualityFilterSettings()
     if not cfg.enabled:
         return QualityVerdict(score=100, action="write", reasons=("quality filter disabled",))
