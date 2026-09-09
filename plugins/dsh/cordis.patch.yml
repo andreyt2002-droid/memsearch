@@ -22,6 +22,15 @@
         #   captureEnabled (bool, default true)   — capture completed turns
         #   injectEnabled (bool, default true)    — inject returned memory candidates
         #   summarizeEnabled (bool, default true) — summarize turns before writing
+        #   summarizeTimeoutMs (number)          — override the per-mode timeout
+        #                          (defaults: 30000 custom-llm, 120000 dsh-headless)
+        #   summarizeProfile (string, default 'headless') — DSH profile booted
+        #                          for dsh-headless summarization; point it at a
+        #                          dedicated cheap-model profile
+        #   summarizeFailureOutput ('note'|'transcript', default 'note') — what
+        #                          a final summarizer failure writes: a short
+        #                          marker, or the marker header plus the capped
+        #                          raw turn so content is not lost
         #   summarizeMode (string, default 'auto')
         #       -> 'auto'         if [plugins.dsh.summarize] provider is set in
         #                          memsearch config → custom-llm, else

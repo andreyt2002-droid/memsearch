@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 
-import { detectDshCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, runQualityGate, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
+import { detectDshCmd, detectMemsearchCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, runQualityGate, runSearch, indexMemory, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
 
 async function withInjectionFixture(searchResults, assertion, oldCore = false) {
   const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-inject-`)
@@ -146,6 +146,29 @@ test('detectDshCmd: DSH_CLI with trailing spaces is trimmed', () => {
   }
 })
 
+test('detectDshCmd: Windows npm wrapper resolves to the JS entrypoint', { skip: process.platform !== 'win32' }, () => {
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  const binDir = fs.mkdtempSync(`${os.tmpdir()}\\dsh-wrapper-`)
+  const wrapper = `${binDir}\\dsh.cmd`
+  const node = `${binDir}\\node.exe`
+  const entry = `${binDir}\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js`
+  fs.mkdirSync(`${binDir}\\node_modules\\@deepseek-ai\\dsh\\lib`, { recursive: true })
+  fs.writeFileSync(wrapper, '@echo off\n', 'utf-8')
+  fs.writeFileSync(node, '', 'utf-8')
+  fs.writeFileSync(entry, '', 'utf-8')
+  try {
+    delete process.env.PATH
+    process.env.DSH_CLI = wrapper
+    assert.deepEqual(detectDshCmd(), [node, entry])
+  } finally {
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
+    fs.rmSync(binDir, { recursive: true, force: true })
+  }
+})
+
 test('summarizeTurn: explicit custom-llm mode dispatches to the LLM path', async () => {
   // custom-llm mode spawns python3 summarize.py; without a real transcript we
   // only assert it picks that branch (no crash before spawn).
@@ -168,6 +191,83 @@ test('summarizeTurn: explicit custom-llm mode dispatches to the LLM path', async
       !/spawn .* ENOENT/.test(error.message),
       `unexpected spawn ENOENT: ${error.message}`,
     )
+  }
+})
+
+test('detectMemsearchCmd: MEMSEARCH_CMD overrides the installed CLI', () => {
+  const previous = process.env.MEMSEARCH_CMD
+  try {
+    process.env.MEMSEARCH_CMD = 'uv --directory D:/CODE-AI/memsearch run memsearch'
+    assert.deepEqual(
+      detectMemsearchCmd(),
+      ['uv', '--directory', 'D:/CODE-AI/memsearch', 'run', 'memsearch'],
+    )
+  } finally {
+    if (previous === undefined) delete process.env.MEMSEARCH_CMD
+    else process.env.MEMSEARCH_CMD = previous
+  }
+})
+
+test('runSearch: executes command spec with native argv', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}\\memsearch-native-search-`)
+  const recorder = `${root}\\recorder.cjs`
+  const argvFile = `${root}\\argv.json`
+  fs.writeFileSync(
+    recorder,
+    `const fs = require('node:fs')\n` +
+      `fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)))\n` +
+      `process.stdout.write(JSON.stringify([{content:'native result'}]))\n`,
+    'utf-8',
+  )
+  try {
+    const result = await runSearch(
+      [process.execPath, recorder],
+      'query with spaces',
+      'ms_native_test',
+      root,
+      'D:\\state\\milvus.db',
+    )
+    assert.deepEqual(result, [{ content: 'native result' }])
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(argvFile, 'utf-8')),
+      ['search', 'query with spaces', '--top-k', '5', '--json-output', '--milvus-uri', 'D:\\state\\milvus.db', '--default-collection', 'ms_native_test'],
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('indexMemory: starts background index with native argv', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}\\memsearch-native-index-`)
+  const memoryDir = `${root}\\memory with spaces`
+  const recorder = `${root}\\recorder.cjs`
+  const argvFile = `${root}\\argv.json`
+  fs.mkdirSync(memoryDir, { recursive: true })
+  fs.writeFileSync(
+    recorder,
+    `const fs = require('node:fs')\nfs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)))\n`,
+    'utf-8',
+  )
+  try {
+    indexMemory(
+      { logger: { warn: () => {} } },
+      [process.execPath, recorder],
+      memoryDir,
+      'ms_native_test',
+      root,
+      '',
+    )
+    const deadline = Date.now() + 5000
+    while (!fs.existsSync(argvFile) && Date.now() < deadline) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    assert.ok(fs.existsSync(argvFile), 'background index process completed')
+    assert.deepEqual(
+      JSON.parse(fs.readFileSync(argvFile, 'utf-8')),
+      ['index', memoryDir, '--default-collection', 'ms_native_test'],
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
   }
 })
 
@@ -481,6 +581,194 @@ test('apply: summarize failure writes unavailable note (not raw)', async () => {
   }
 })
 
+test('summarizeTurn: transient failure is retried once and can succeed', async () => {
+  // DSH_CLI points at a node recorder that exits 1 on the first invocation
+  // and prints a summary on the second: the retry must produce the summary
+  // instead of an error. Node is the recorder so the test runs on Windows too
+  // (no /bin/sh shebang dependency).
+  const prevCli = process.env.DSH_CLI
+  const tmp = os.tmpdir()
+  const counterFile = `${tmp}/memsearch-retrycount-${process.pid}.txt`
+  const recorder = `${tmp}/memsearch-retry-recorder-${process.pid}.cjs`
+  fs.writeFileSync(
+    recorder,
+    `const fs = require('node:fs')\n` +
+      `let n = 0\n` +
+      `try { n = Number(fs.readFileSync(${JSON.stringify(counterFile)}, 'utf-8')) || 0 } catch {}\n` +
+      `n += 1\n` +
+      `fs.writeFileSync(${JSON.stringify(counterFile)}, String(n))\n` +
+      `if (n < 2) process.exit(1)\n` +
+      `console.log('- summarized on retry')\n`,
+    'utf-8',
+  )
+  try {
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    const opts = {
+      summarizeMode: 'dsh-headless',
+      agentName: 'X',
+      summarizeProvider: '',
+      summarizeModel: '',
+      summarizeRetryBackoffMs: 0,
+    }
+    const ctx = { logger: { warn: () => {} } }
+    const summary = await summarizeTurn(ctx, opts, 'turn text', process.cwd())
+    assert.equal(summary, '- summarized on retry')
+    assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'exactly two attempts')
+  } finally {
+    try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
+    try { fs.unlinkSync(counterFile) } catch { /* cleanup */ }
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+  }
+})
+
+test('summarizeTurn: deterministic CLI-not-found failure is not retried', async () => {
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  const prevHome = process.env.HOME
+  try {
+    delete process.env.DSH_CLI
+    process.env.PATH = '/nonexistent'
+    process.env.HOME = '/nonexistent-home'
+    const warnings = []
+    const ctx = { logger: { warn: (m) => warnings.push(m) } }
+    const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeProvider: '', summarizeModel: '', summarizeRetryBackoffMs: 0 }
+    await assert.rejects(
+      summarizeTurn(ctx, opts, 'turn text', process.cwd()),
+      /dsh CLI not found/,
+    )
+    assert.ok(
+      !warnings.some((w) => w.includes('retrying once')),
+      `setup failure must not be retried: ${warnings}`,
+    )
+  } finally {
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
+    if (prevHome === undefined) delete process.env.HOME
+    else process.env.HOME = prevHome
+  }
+})
+
+test('summarizeTurn: summarizeTimeoutMs override times out a slow summarizer', async () => {
+  // A node recorder that idles for 5 s: with summarizeTimeoutMs=200 each
+  // attempt times out, the single retry fires, and the final error names the
+  // timeout.
+  const prevCli = process.env.DSH_CLI
+  const tmp = os.tmpdir()
+  const counterFile = `${tmp}/memsearch-slowcount-${process.pid}.txt`
+  const recorder = `${tmp}/memsearch-slow-recorder-${process.pid}.cjs`
+  fs.writeFileSync(
+    recorder,
+    `const fs = require('node:fs')\n` +
+      `fs.writeFileSync(${JSON.stringify(counterFile)}, String(Number(fs.existsSync(${JSON.stringify(counterFile)}) ? fs.readFileSync(${JSON.stringify(counterFile)}, 'utf-8') : 0) + 1))\n` +
+      `setTimeout(() => {}, 5000)\n`,
+    'utf-8',
+  )
+  try {
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    const opts = {
+      summarizeMode: 'dsh-headless',
+      agentName: 'X',
+      summarizeProvider: '',
+      summarizeModel: '',
+      summarizeTimeoutMs: 200,
+      summarizeRetryBackoffMs: 0,
+    }
+    const ctx = { logger: { warn: () => {} } }
+    await assert.rejects(
+      summarizeTurn(ctx, opts, 'turn text', process.cwd()),
+      /timed out/,
+    )
+    assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'timeout retried once')
+  } finally {
+    try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
+    try { fs.unlinkSync(counterFile) } catch { /* cleanup */ }
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+  }
+})
+
+test('summarizeHeadless: summarizeProfile is forwarded to the dsh CLI', async () => {
+  const prevCli = process.env.DSH_CLI
+  const tmp = os.tmpdir()
+  const argvFile = `${tmp}/memsearch-dsh-profile-argv-${process.pid}.json`
+  const recorder = `${tmp}/memsearch-dsh-profile-recorder-${process.pid}.cjs`
+  fs.writeFileSync(
+    recorder,
+    `const fs = require('node:fs')\n` +
+      `fs.writeFileSync(${JSON.stringify(argvFile)}, JSON.stringify(process.argv.slice(2)))\n`,
+    'utf-8',
+  )
+  try {
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    const opts = {
+      summarizeMode: 'dsh-headless',
+      agentName: 'X',
+      summarizeProvider: '',
+      summarizeModel: '',
+      summarizeProfile: 'memsearch-summary',
+    }
+    const ctx = { logger: { warn: () => {} } }
+    await summarizeTurn(ctx, opts, 'turn text', process.cwd())
+    const recorded = JSON.parse(fs.readFileSync(argvFile, 'utf-8'))
+    const profileIndex = recorded.indexOf('--profile')
+    assert.ok(profileIndex !== -1, `--profile present: ${JSON.stringify(recorded)}`)
+    assert.equal(recorded[profileIndex + 1], 'memsearch-summary', 'configured profile booted')
+  } finally {
+    try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
+    try { fs.unlinkSync(argvFile) } catch { /* cleanup */ }
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+  }
+})
+
+test('apply: summarize failure with summarizeFailureOutput:transcript preserves the raw turn', async () => {
+  const tmp = os.tmpdir()
+  const projDir = `${tmp}/memsearch-failraw-${process.pid}`
+  const listeners = {}
+  const ctx = {
+    logger: { warn: () => {}, debug: () => {} },
+    skills: { register: () => {} },
+    on: (name, fn) => { listeners[name] = fn },
+  }
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  const prevHome = process.env.HOME
+  try {
+    delete process.env.DSH_CLI
+    process.env.PATH = '/nonexistent'
+    process.env.HOME = '/nonexistent-home'
+    apply(ctx, { summarizeFailureOutput: 'transcript', summarizeRetryBackoffMs: 0 })
+    const session = {
+      id: 'session-failraw-test',
+      header: { cwd: projDir },
+      events: [
+        { type: 'turn/start', data: { turn: 1 } },
+        { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'important raw content fallback-marker-002' }] } },
+        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
+        { type: 'turn/end', data: { turn: 1 } },
+      ],
+    }
+    await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
+    await new Promise((r) => setTimeout(r, 500))
+    const memoryDir = `${projDir}/.memsearch/memory`
+    const files = fs.readdirSync(memoryDir)
+    const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
+    assert.ok(content.includes('Summarization failed'), 'failure header written')
+    assert.ok(content.includes('fallback-marker-002'), 'raw turn preserved')
+    assert.ok(!content.includes('Memory summary unavailable'), 'default note wording not used')
+    assert.ok(content.includes('<!-- session:session-failraw-test turn:1 '), 'anchor preserved')
+  } finally {
+    fs.rmSync(projDir, { recursive: true, force: true })
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
+    if (prevHome === undefined) delete process.env.HOME
+    else process.env.HOME = prevHome
+  }
+})
+
 test('apply: multi-project capture writes to each project memory dir', async () => {
   const tmp = os.tmpdir()
   const projA = `${tmp}/memsearch-projA-${process.pid}`
@@ -623,6 +911,20 @@ test('renderTurn: renders user/assistant/tool events into the shared format', ()
   assert.ok(render.includes('[User]: hello there'), 'user line')
   assert.ok(render.includes('[Assistant]: hi back'), 'assistant line')
   assert.ok(render.includes('[Tool call]: bash'), 'tool line')
+})
+
+test('renderTurn: reads current DSH sessions through snapshotEvents', () => {
+  const events = [
+    { type: 'turn/start', data: { turn: 8 } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'snapshot capture marker' }] } },
+    { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'captured' }] } } },
+    { type: 'turn/end', data: { turn: 8 } },
+  ]
+  const session = {
+    snapshotEvents: () => events,
+  }
+  const render = renderTurn(session, { data: { turn: 8 } })
+  assert.ok(render.includes('snapshot capture marker'), 'uses snapshotEvents instead of removed events array')
 })
 
 test('renderTurn: returns null when no user message', () => {

@@ -70,23 +70,31 @@ These are NOT in the MemSearch TOML. They live in the profile patch under the
     injectEnabled: true      # inject returned memory candidates
     summarizeEnabled: true   # summarize turns before writing
     summarizeMode: auto      # auto | dsh-headless | custom-llm
+    summarizeTimeoutMs: 120000  # optional; defaults 30000 (custom-llm) / 120000 (dsh-headless)
+    summarizeProfile: headless # dsh-headless only; DSH profile to boot (use a cheap-model profile)
+    summarizeFailureOutput: note # note | transcript; transcript keeps the raw turn on final failure
 ```
+
+Transient summarizer failures (timeouts, nonzero exits) are retried once after
+a 2 s backoff within the same backend.
 
 ## Summarizer backends
 
 - **`auto`** (default) — if `[plugins.dsh.summarize] provider` is set, uses
   `custom-llm`; otherwise `dsh-headless`.
-- **`dsh-headless`** — boots a one-shot `dsh --profile headless` agent. The
-  sub-agent's model is the deployment's `agent-default-model` from
-  `~/.dsh/settings.yaml` (the same selection the Web UI model picker writes).
+- **`dsh-headless`** — boots a one-shot `dsh --profile <summarizeProfile>`
+  agent (default profile `headless`). The sub-agent's model is that profile's
+  `agent-default-model` from `~/.dsh/settings.yaml` (the same selection the
+  Web UI model picker writes).
   **`[plugins.dsh.summarize]` provider/model do NOT apply here** — change the
-  model in DSH settings instead.
+  model in DSH settings or point `summarizeProfile` at a cheap-model profile.
 - **`custom-llm`** — a direct LLM call using `[llm.providers.*]`; provider/model
   come from `[plugins.dsh.summarize]`.
 
 There is no silent fallback between modes: the resolved backend is the one used.
 A failed summarization writes a short unavailable note, never a raw transcript
-dump.
+dump — unless `summarizeFailureOutput: transcript` is set, which preserves the
+capped raw turn under a failure header.
 
 ## Native model defaults
 

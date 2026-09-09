@@ -25,6 +25,14 @@ review   ── web UI dock panel ──> GET/POST /memsearch-dsh/* ──> list
 
 ## Install
 
+### Native Windows
+
+The DSH plugin runs its MemSearch CLI, quality gate, search, indexing, skill
+installation, and maintenance helpers with direct argv. Runtime Bash or WSL is
+not required, and paths containing spaces remain one argument. During source
+development, set `MEMSEARCH_CMD` before starting DSH so the linked plugin uses
+the checkout environment and its installed extras.
+
 ### From npm (recommended)
 
 ```bash
@@ -72,8 +80,11 @@ block (patch the `memsearch` row you inserted). All keys are optional.
 | --- | --- | --- | --- |
 | `captureEnabled` | bool | `true` | Capture completed turns into memory. |
 | `injectEnabled` | bool | `true` | Inject returned memory candidates before each turn's first step. |
-| `summarizeEnabled` | bool | `true` | Summarize turns before writing (on failure a short unavailable note is written, never a raw dump). |
+| `summarizeEnabled` | bool | `true` | Summarize turns before writing (on final failure a short unavailable note is written, or the raw turn when `summarizeFailureOutput: transcript`). |
 | `summarizeMode` | string | `auto` | Summarizer backend. `auto` (default) mirrors the other platform plugins: if `[plugins.dsh.summarize] provider` is set in memsearch config, it uses `custom-llm`; otherwise `dsh-headless` (zero-config DSH agent). Explicit `dsh-headless` / `custom-llm` pin the backend. |
+| `summarizeTimeoutMs` | number | `30000` / `120000` | Summarizer timeout, overriding the per-mode default (30 s `custom-llm`, 120 s `dsh-headless` — the headless backend boots a full DSH process plus a model call). Transient failures (timeout, nonzero exit) are retried once after a 2 s backoff. |
+| `summarizeProfile` | string | `headless` | DSH profile booted for `dsh-headless` summarization. Point it at a dedicated cheap-model profile so summarization never uses the main profile's `agent-default-model`. |
+| `summarizeFailureOutput` | string | `note` | What a final summarizer failure writes: `note` (short unavailable marker, current behavior) or `transcript` (a failure header plus the capped raw turn, so turn content is not lost). |
 
 Everything else — provider/model, Milvus, collection, memory dir — comes from
 **memsearch config / environment**, exactly like the other platform plugins
@@ -87,6 +98,11 @@ Everything else — provider/model, Milvus, collection, memory dir — comes fro
   or `--collection` passed to the memsearch CLI.
 - **Memory dir** → `MEMSEARCH_DIR` env (explicit → global scope), else
   `<project>/.memsearch`.
+- **CLI command** → `MEMSEARCH_CMD` env when set; otherwise the plugin finds an
+  installed `memsearch` or `uvx`. During source development, point it at the
+  checkout so extras match the linked plugin, for example
+  `uv --directory <memsearch-checkout> run memsearch`. Set the variable before
+  starting the DSH profile.
 
 ### Maintenance tasks (PROJECT.md / USER.md / skills)
 
@@ -133,17 +149,21 @@ a direct LLM call; configure nothing and you get a headless agent.
   This means the plugin behaves like the other four: **configure a provider
   → direct LLM; configure nothing → headless**.
 - **`dsh-headless`** — boots a one-shot DSH headless agent
-  (`dsh --profile headless "<summarize task>"`) to write the notes, mirroring
+  (`dsh --profile <summarizeProfile> "<summarize task>"`, default profile
+  `headless`) to write the notes, mirroring
   how the other plugins reuse their own agent's headless mode. Zero-config for
-  anyone already using DSH: the sub-agent's model is the deployment's
+  anyone already using DSH: the sub-agent's model is the booted profile's
   `agent-default-model` — the user layer of `~/.dsh/settings.yaml` (the same
   selection the Web UI model settings write) wins over any patch, so **the
   `[plugins.dsh.summarize]` provider/model do NOT apply here** — change the
   model in DSH settings (`agent-default-model:` in `~/.dsh/settings.yaml`, or
-  the Web UI model picker) instead. The boot is asynchronous and fire-and-forget,
+  the Web UI model picker), or set `summarizeProfile` to a dedicated
+  cheap-model profile. The boot is asynchronous and fire-and-forget,
   so the few seconds of headless startup never block the conversation. Requires
-  `dsh` on PATH or `DSH_CLI` set to the CLI
-  entry. The sub-agent is booted with `MEMSEARCH_DSH_SUMMARIZE=1`; the plugin
+  `dsh` on PATH or `DSH_CLI` set to the CLI entry. On Windows, an npm-generated
+  `.cmd` override is resolved to its adjacent Node JS entrypoint so multi-line
+  prompts never pass through `cmd.exe` reparsing. The sub-agent is booted with
+  `MEMSEARCH_DSH_SUMMARIZE=1`; the plugin
   checks that flag and stays inert (no capture / inject / skill) inside the
   summarizer, so the summarizer's own session is never re-captured in a loop.
 - **`custom-llm`** — `scripts/summarize.py` imports memsearch's
@@ -162,12 +182,15 @@ a direct LLM call; configure nothing and you get a headless agent.
 There is **no automatic fallback between modes**: the backend you configure
 (or auto resolves) is the backend used. If it fails (missing dsh CLI, bad
 provider config), a short unavailable note is written with the reason — the
-plugin never silently switches to an LLM you did not configure.
+plugin never silently switches to an LLM you did not configure. Transient
+failures (timeouts, nonzero exits) are retried once after a 2 s backoff within
+the same backend.
 
 A failed summarization writes a short unavailable note (mirroring Claude
 Code's behavior — memory stays clean, the transcript anchor keeps the raw
 content reachable for progressive disclosure), and logs a visible warning
-through the DSH logger.
+through the DSH logger. Set `summarizeFailureOutput: transcript` to preserve
+the capped raw turn in the journal under a failure header instead.
 
 ## How it works
 
