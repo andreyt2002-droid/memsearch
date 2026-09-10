@@ -5,9 +5,10 @@ import fs from 'node:fs'
 import os from 'node:os'
 import { join, sep } from 'node:path'
 
-import { detectDshCmd, detectMemsearchCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, runQualityGate, runSearch, indexMemory, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
+import { detectDshCmd, detectMemsearchCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, filterDiagnosticFields, runQualityGate, runSearch, indexMemory, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
+import { withIsolatedEnv } from './env.js'
 
-async function withInjectionFixture(searchResults, assertion, oldCore = false) {
+async function withInjectionFixture(searchResults, assertion, oldCore = false, diagnostic = false) {
   const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-inject-`)
   const projectDir = `${root}/project`
   const memoryDir = `${root}/state/memory`
@@ -61,12 +62,17 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
       const { apply } = await import(process.env.MEMSEARCH_PLUGIN_URL)
       const listeners = {}
       const registeredSkills = []
+      let disposeDiagnostics = async () => {}
       const ctx = {
         logger: { warn: () => {}, debug: () => {} },
         skills: { register: (skill) => registeredSkills.push(skill) },
         on: (name, listener) => { listeners[name] = listener },
+        effect: (setup) => { disposeDiagnostics = setup() },
       }
-      apply(ctx, { captureEnabled: false })
+      apply(ctx, {
+        captureEnabled: false,
+        diagnosticLogEnabled: process.env.MEMSEARCH_TEST_DIAGNOSTIC === '1',
+      })
       const decision = {
         kind: 'enter',
         messages: [{ role: 'user', content: [{ type: 'text', text: 'What did we decide about the release?' }] }],
@@ -81,6 +87,7 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
       } catch (caught) {
         error = caught.message
       }
+      await disposeDiagnostics()
       process.stdout.write(JSON.stringify({
         unchanged: result === decision,
         result,
@@ -102,63 +109,40 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
         MEMSEARCH_TEST_PROJECT: projectDir,
         MEMSEARCH_TEST_RESULT: resultFile,
         MEMSEARCH_TEST_OLD_CORE: oldCore ? '1' : '0',
+        MEMSEARCH_TEST_DIAGNOSTIC: diagnostic ? '1' : '0',
       },
     })
-    await assertion({ ...JSON.parse(stdout), callLog })
+    const logDir = join(root, 'state', 'logs')
+    const diagnosticLog = fs.existsSync(logDir)
+      ? fs.readdirSync(logDir).sort().map((file) => fs.readFileSync(join(logDir, file), 'utf-8')).join('')
+      : ''
+    await assertion({ ...JSON.parse(stdout), callLog, diagnosticLog })
   } finally {
     fs.rmSync(root, { recursive: true, force: true })
   }
 }
 
-test('detectDshCmd: prefers dsh on PATH as a plain argv', () => {
+test('detectDshCmd: prefers dsh on PATH as a plain argv', async () => {
   // DSH_CLI is checked after PATH; simulate PATH hit by masking DSH_CLI.
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  try {
-    delete process.env.DSH_CLI
-    process.env.PATH = '/usr/bin:/bin'
+  await withIsolatedEnv({ DSH_CLI: null, PATH: '/usr/bin:/bin' }, () => {
     const cmd = detectDshCmd()
     assert.ok(cmd === null || (Array.isArray(cmd) && cmd.length >= 1), `expected null or argv, got ${JSON.stringify(cmd)}`)
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-  }
+  })
 })
 
-test('detectDshCmd: DSH_CLI interpreter invocation returns argv array', () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  try {
-    delete process.env.PATH
-    process.env.DSH_CLI = 'node /opt/dsh/bin.js'
-    const cmd = detectDshCmd()
-    assert.deepEqual(cmd, ['node', '/opt/dsh/bin.js'])
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-  }
+test('detectDshCmd: DSH_CLI interpreter invocation returns argv array', async () => {
+  await withIsolatedEnv({ DSH_CLI: 'node /opt/dsh/bin.js', PATH: null }, () => {
+    assert.deepEqual(detectDshCmd(), ['node', '/opt/dsh/bin.js'])
+  })
 })
 
-test('detectDshCmd: DSH_CLI with trailing spaces is trimmed', () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  try {
-    delete process.env.PATH
-    process.env.DSH_CLI = 'dsh   '
-    const cmd = detectDshCmd()
-    assert.deepEqual(cmd, ['dsh'])
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-  }
+test('detectDshCmd: DSH_CLI with trailing spaces is trimmed', async () => {
+  await withIsolatedEnv({ DSH_CLI: 'dsh   ', PATH: null }, () => {
+    assert.deepEqual(detectDshCmd(), ['dsh'])
+  })
 })
 
-test('detectDshCmd: Windows npm wrapper resolves to the JS entrypoint', { skip: process.platform !== 'win32' }, () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
+test('detectDshCmd: Windows npm wrapper resolves to the JS entrypoint', { skip: process.platform !== 'win32' }, async () => {
   const binDir = fs.mkdtempSync(`${os.tmpdir()}/dsh-wrapper-`).replaceAll('/', '\\')
   const wrapper = `${binDir}\\dsh.cmd`
   const node = `${binDir}\\node.exe`
@@ -168,13 +152,10 @@ test('detectDshCmd: Windows npm wrapper resolves to the JS entrypoint', { skip: 
   fs.writeFileSync(node, '', 'utf-8')
   fs.writeFileSync(entry, '', 'utf-8')
   try {
-    delete process.env.PATH
-    process.env.DSH_CLI = wrapper
-    assert.deepEqual(detectDshCmd(), [node, entry])
+    await withIsolatedEnv({ DSH_CLI: wrapper, PATH: null }, () => {
+      assert.deepEqual(detectDshCmd(), [node, entry])
+    })
   } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
     fs.rmSync(binDir, { recursive: true, force: true })
   }
 })
@@ -204,18 +185,13 @@ test('summarizeTurn: explicit custom-llm mode dispatches to the LLM path', async
   }
 })
 
-test('detectMemsearchCmd: MEMSEARCH_CMD overrides the installed CLI', () => {
-  const previous = process.env.MEMSEARCH_CMD
-  try {
-    process.env.MEMSEARCH_CMD = 'uv --directory D:/CODE-AI/memsearch run memsearch'
+test('detectMemsearchCmd: MEMSEARCH_CMD overrides the installed CLI', async () => {
+  await withIsolatedEnv({ MEMSEARCH_CMD: 'uv --directory D:/CODE-AI/memsearch run memsearch' }, () => {
     assert.deepEqual(
       detectMemsearchCmd(),
       ['uv', '--directory', 'D:/CODE-AI/memsearch', 'run', 'memsearch'],
     )
-  } finally {
-    if (previous === undefined) delete process.env.MEMSEARCH_CMD
-    else process.env.MEMSEARCH_CMD = previous
-  }
+  })
 })
 
 test('runSearch: executes command spec with native argv', async () => {
@@ -351,13 +327,7 @@ test('resolveSummarizeMode: auto with configured provider selects custom-llm', (
 test('summarizeTurn: default (no mode configured) dispatches to dsh-headless', async () => {
   // The default is dsh-headless: an omitted summarizeMode must boot the dsh
   // agent, so without a CLI it errors with "dsh CLI not found".
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
-  try {
-    delete process.env.DSH_CLI
-    process.env.PATH = '/nonexistent'
-    process.env.HOME = '/nonexistent-home' // mask pnpm-global dsh fallback
+  await withIsolatedEnv({ DSH_CLI: null, PATH: '/nonexistent', HOME: '/nonexistent-home' }, async () => {
     const opts = { agentName: 'X', summarizeProvider: '', summarizeModel: '' } // no summarizeMode
     const ctx = { logger: { warn: () => {} } }
     const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
@@ -365,23 +335,11 @@ test('summarizeTurn: default (no mode configured) dispatches to dsh-headless', a
       summarizeTurn(ctx, opts, render, process.cwd()),
       /dsh CLI not found/,
     )
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
-  }
+  })
 })
 
 test('summarizeTurn: dsh-headless mode without CLI errors visibly', async () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
-  try {
-    delete process.env.DSH_CLI
-    process.env.PATH = '/nonexistent'
-    process.env.HOME = '/nonexistent-home' // mask pnpm-global dsh fallback
+  await withIsolatedEnv({ DSH_CLI: null, PATH: '/nonexistent', HOME: '/nonexistent-home' }, async () => {
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeProvider: '', summarizeModel: '' }
     const ctx = { logger: { warn: () => {} } }
     const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
@@ -389,13 +347,7 @@ test('summarizeTurn: dsh-headless mode without CLI errors visibly', async () => 
       summarizeTurn(ctx, opts, render, process.cwd()),
       /dsh CLI not found/,
     )
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
-  }
+  })
 })
 
 test('summarizeTurn: custom-llm forwards --provider/--model to summarize.py', async () => {
@@ -414,34 +366,31 @@ test('summarizeTurn: custom-llm forwards --provider/--model to summarize.py', as
       'process.stdin.resume()\n',
     'utf-8',
   )
-  const prevPython = process.env.MEMSEARCH_PYTHON
-  const prevArgv = process.env.MEMSEARCH_TEST_ARGV
   try {
-    process.env.MEMSEARCH_PYTHON = JSON.stringify([process.execPath, recorder])
-    process.env.MEMSEARCH_TEST_ARGV = argvFile
-    const opts = {
-      summarizeMode: 'custom-llm',
-      agentName: 'AgentX',
-      summarizeProvider: 'deepseek-zilliz',
-      summarizeModel: 'deepseek-v4-pro',
-    }
-    const ctx = { logger: { warn: () => {} } }
-    const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
-    const summary = await summarizeTurn(ctx, opts, render, process.cwd())
-    assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
-    const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
-    assert.ok(recorded[0].replaceAll('\\', '/').endsWith('scripts/summarize.py'), `first arg = summarize.py, got: ${recorded[0]}`)
-    const joined = recorded.join(' ')
-    assert.ok(joined.includes('--provider deepseek-zilliz'), `--provider forwarded: ${joined}`)
-    assert.ok(joined.includes('--model deepseek-v4-pro'), `--model forwarded: ${joined}`)
-    assert.ok(joined.includes('--agent-name AgentX'), `--agent-name forwarded: ${joined}`)
+    await withIsolatedEnv({
+      MEMSEARCH_PYTHON: JSON.stringify([process.execPath, recorder]),
+      MEMSEARCH_TEST_ARGV: argvFile,
+    }, async () => {
+      const opts = {
+        summarizeMode: 'custom-llm',
+        agentName: 'AgentX',
+        summarizeProvider: 'deepseek-zilliz',
+        summarizeModel: 'deepseek-v4-pro',
+      }
+      const ctx = { logger: { warn: () => {} } }
+      const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
+      const summary = await summarizeTurn(ctx, opts, render, process.cwd())
+      assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
+      const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
+      assert.ok(recorded[0].replaceAll('\\', '/').endsWith('scripts/summarize.py'), `first arg = summarize.py, got: ${recorded[0]}`)
+      const joined = recorded.join(' ')
+      assert.ok(joined.includes('--provider deepseek-zilliz'), `--provider forwarded: ${joined}`)
+      assert.ok(joined.includes('--model deepseek-v4-pro'), `--model forwarded: ${joined}`)
+      assert.ok(joined.includes('--agent-name AgentX'), `--agent-name forwarded: ${joined}`)
+    })
   } finally {
     try { fs.rmSync(recorder, { force: true }) } catch { /* cleanup */ }
     try { fs.unlinkSync(argvFile) } catch { /* cleanup */ }
-    if (prevPython === undefined) delete process.env.MEMSEARCH_PYTHON
-    else process.env.MEMSEARCH_PYTHON = prevPython
-    if (prevArgv === undefined) delete process.env.MEMSEARCH_TEST_ARGV
-    else process.env.MEMSEARCH_TEST_ARGV = prevArgv
   }
 })
 
@@ -459,32 +408,27 @@ test('summarizeTurn: custom-llm surfaces summarize.py stderr as a visible error'
       'process.stdin.resume()\n',
     'utf-8',
   )
-  const prevPython = process.env.MEMSEARCH_PYTHON
   try {
-    process.env.MEMSEARCH_PYTHON = JSON.stringify([process.execPath, recorder])
-    const opts = {
-      summarizeMode: 'custom-llm',
-      agentName: 'X',
-      summarizeProvider: 'deepseek-zilliz',
-      summarizeModel: '',
-    }
-    const ctx = { logger: { warn: () => {} } }
-    const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
-    await assert.rejects(
-      summarizeTurn(ctx, opts, render, process.cwd()),
-      /provider deepseek-zilliz not found in config/,
-    )
+    await withIsolatedEnv({ MEMSEARCH_PYTHON: JSON.stringify([process.execPath, recorder]) }, async () => {
+      const opts = {
+        summarizeMode: 'custom-llm',
+        agentName: 'X',
+        summarizeProvider: 'deepseek-zilliz',
+        summarizeModel: '',
+      }
+      const ctx = { logger: { warn: () => {} } }
+      const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
+      await assert.rejects(
+        summarizeTurn(ctx, opts, render, process.cwd()),
+        /provider deepseek-zilliz not found in config/,
+      )
+    })
   } finally {
     try { fs.rmSync(recorder, { force: true }) } catch { /* cleanup */ }
-    if (prevPython === undefined) delete process.env.MEMSEARCH_PYTHON
-    else process.env.MEMSEARCH_PYTHON = prevPython
   }
 })
 
 test('detectDshCmd: falls back to pnpm global bin directory', async () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
   const fakeHome = `${tmp}/memsearch-home-${process.pid}`
@@ -492,19 +436,11 @@ test('detectDshCmd: falls back to pnpm global bin directory', async () => {
   fs.writeFileSync(`${fakeHome}/.local/share/pnpm/dsh`, '#!/bin/sh\nexit 0\n', 'utf-8')
   fs.chmodSync(`${fakeHome}/.local/share/pnpm/dsh`, 0o755)
   try {
-    delete process.env.DSH_CLI
-    delete process.env.PATH
-    process.env.HOME = fakeHome
-    const cmd = detectDshCmd()
-    assert.deepEqual(cmd, [join(fakeHome, '.local', 'share', 'pnpm', 'dsh')])
+    await withIsolatedEnv({ DSH_CLI: null, PATH: null, HOME: fakeHome }, () => {
+      assert.deepEqual(detectDshCmd(), [join(fakeHome, '.local', 'share', 'pnpm', 'dsh')])
+    })
   } finally {
     try { fs.rmSync(fakeHome, { recursive: true, force: true }) } catch { /* cleanup */ }
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    if (prevPath === undefined) delete process.env.PATH
-    else process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
   }
 })
 
@@ -523,10 +459,12 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
   const tmp = os.tmpdir()
   const projDir = `${tmp}/memsearch-raw-${process.pid}`
   const listeners = {}
+  let disposeDiagnostics = async () => {}
   const ctx = {
     logger: { warn: () => {}, debug: () => {} },
     skills: { register: () => {} },
     on: (name, fn) => { listeners[name] = fn },
+    effect: (setup) => { disposeDiagnostics = setup() },
   }
   const session = {
     id: 'session-raw-test',
@@ -542,25 +480,85 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
     // Mask the ambient checkout CLI override (start-dsh-web.cmd) and PATH so
     // the test does not spawn a real background index holding the temp dir.
     // apply() resolves the CLI at registration time, so it must run masked too.
-    const prevMsCmd = process.env.MEMSEARCH_CMD
-    const prevPath = process.env.PATH
-    delete process.env.MEMSEARCH_CMD
-    process.env.PATH = '/nonexistent'
-    apply(ctx, { summarizeEnabled: false })
-    // session/event fires with (session, event); capture drains asynchronously.
-    await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
-    // captureChain runs async; wait a beat for the write to land.
-    await new Promise((r) => setTimeout(r, 300))
-    const memoryDir = `${projDir}/.memsearch/memory`
-    const files = fs.readdirSync(memoryDir)
-    assert.equal(files.length, 1, 'one daily file written')
-    const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
-    assert.ok(content.includes('raw-marker-001'), 'raw transcript written when summarize disabled')
-    assert.ok(content.includes('<!-- session:session-raw-test turn:1 '), 'anchor present')
-    process.env.PATH = prevPath
-    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
+    await withIsolatedEnv({ MEMSEARCH_CMD: null, PATH: '/nonexistent' }, async () => {
+      apply(ctx, { summarizeEnabled: false, diagnosticLogEnabled: true })
+      // session/event fires with (session, event); capture drains asynchronously.
+      await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
+      // captureChain runs async; wait a beat for the write to land.
+      await new Promise((r) => setTimeout(r, 300))
+      const memoryDir = `${projDir}/.memsearch/memory`
+      const files = fs.readdirSync(memoryDir)
+      assert.equal(files.length, 1, 'one daily file written')
+      const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
+      assert.ok(content.includes('raw-marker-001'), 'raw transcript written when summarize disabled')
+      assert.ok(content.includes('<!-- session:session-raw-test turn:1 '), 'anchor present')
+      const logDir = `${projDir}/.memsearch/logs`
+      const logDeadline = Date.now() + 5000
+      let log = ''
+      while (!log.includes('capture.written') && Date.now() < logDeadline) {
+        if (fs.existsSync(logDir)) {
+          const logFiles = fs.readdirSync(logDir)
+          if (logFiles.length > 0) log = fs.readFileSync(join(logDir, logFiles[0]), 'utf-8')
+        }
+        if (!log.includes('capture.written')) await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      const events = log.trim().split('\n').map((line) => JSON.parse(line).event)
+      assert.ok(events.includes('capture.queued'))
+      assert.ok(events.includes('capture.started'))
+      assert.ok(events.includes('capture.written'))
+      assert.ok(events.indexOf('capture.queued') < events.indexOf('capture.started'))
+      assert.ok(events.indexOf('capture.started') < events.indexOf('capture.written'))
+      assert.ok(!log.includes('raw-marker-001'), 'diagnostic log excludes captured content')
+      await disposeDiagnostics()
+    })
   } finally {
+    await disposeDiagnostics()
     fs.rmSync(projDir, { recursive: true, force: true })
+  }
+})
+
+test('apply: diagnostic log failure warns once and does not block capture', async () => {
+  const projectDir = fs.mkdtempSync(`${os.tmpdir()}/memsearch-diagnostic-fail-`)
+  fs.mkdirSync(join(projectDir, '.memsearch'), { recursive: true })
+  fs.writeFileSync(join(projectDir, '.memsearch', 'logs'), 'not a directory')
+  const listeners = {}
+  const warnings = []
+  let disposeDiagnostics = async () => {}
+  const ctx = {
+    logger: { warn: (message) => warnings.push(message), debug: () => {} },
+    skills: { register: () => {} },
+    on: (name, fn) => { listeners[name] = fn },
+    effect: (setup) => { disposeDiagnostics = setup() },
+  }
+  const session = {
+    id: 'session-diagnostic-fail',
+    header: { cwd: projectDir },
+    events: [
+      { type: 'turn/start', data: { turn: 1 } },
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'diagnostic-fail-capture-marker' }] } },
+      { type: 'turn/end', data: { turn: 1 } },
+    ],
+  }
+  try {
+    await withIsolatedEnv({ MEMSEARCH_CMD: null, PATH: '/nonexistent' }, async () => {
+      apply(ctx, { summarizeEnabled: false, diagnosticLogEnabled: true })
+      listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
+      const deadline = Date.now() + 5000
+      const memoryDir = join(projectDir, '.memsearch', 'memory')
+      while ((!fs.existsSync(memoryDir) || fs.readdirSync(memoryDir).length === 0) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      const memoryFile = join(memoryDir, fs.readdirSync(memoryDir)[0])
+      assert.ok(fs.readFileSync(memoryFile, 'utf-8').includes('diagnostic-fail-capture-marker'))
+      while (!warnings.some((message) => message.includes('diagnostic log unavailable')) && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 25))
+      }
+      assert.equal(warnings.filter((message) => message.includes('diagnostic log unavailable')).length, 1)
+      await disposeDiagnostics()
+    })
+  } finally {
+    await disposeDiagnostics()
+    fs.rmSync(projectDir, { recursive: true, force: true })
   }
 })
 
@@ -573,44 +571,33 @@ test('apply: summarize failure writes unavailable note (not raw)', async () => {
     skills: { register: () => {} },
     on: (name, fn) => { listeners[name] = fn },
   }
-  // Default summarizeEnabled:true + auto resolves headless with no CLI → error
-  // path in processTurn → unavailable note.
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
-  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
-    delete process.env.DSH_CLI
-    delete process.env.MEMSEARCH_CMD
-    process.env.PATH = '/nonexistent'
-    process.env.HOME = '/nonexistent-home' // mask pnpm-global dsh fallback (would boot a real agent)
-    apply(ctx, {})
-    const session = {
-      id: 'session-fail-test',
-      header: { cwd: projDir },
-      events: [
-        { type: 'turn/start', data: { turn: 1 } },
-        { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'secret raw content that must not leak' }] } },
-        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
-        { type: 'turn/end', data: { turn: 1 } },
-      ],
-    }
-    await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
-    await new Promise((r) => setTimeout(r, 500))
-    const memoryDir = `${projDir}/.memsearch/memory`
-    const files = fs.readdirSync(memoryDir)
-    const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
-    assert.ok(content.includes('Memory summary unavailable'), 'unavailable note written on failure')
-    assert.ok(!content.includes('secret raw content'), 'raw content must NOT be written')
-    assert.ok(content.includes('<!-- session:session-fail-test turn:1 '), 'anchor preserved')
+    // Default summarizeEnabled:true + auto resolves headless with no CLI → error
+    // path in processTurn → unavailable note.
+    await withIsolatedEnv({ DSH_CLI: null, MEMSEARCH_CMD: null, PATH: '/nonexistent', HOME: '/nonexistent-home' }, async () => {
+      // (HOME masks the pnpm-global dsh fallback, which would boot a real agent.)
+      apply(ctx, {})
+      const session = {
+        id: 'session-fail-test',
+        header: { cwd: projDir },
+        events: [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'secret raw content that must not leak' }] } },
+          { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
+          { type: 'turn/end', data: { turn: 1 } },
+        ],
+      }
+      await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
+      await new Promise((r) => setTimeout(r, 500))
+      const memoryDir = `${projDir}/.memsearch/memory`
+      const files = fs.readdirSync(memoryDir)
+      const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
+      assert.ok(content.includes('Memory summary unavailable'), 'unavailable note written on failure')
+      assert.ok(!content.includes('secret raw content'), 'raw content must NOT be written')
+      assert.ok(content.includes('<!-- session:session-fail-test turn:1 '), 'anchor preserved')
+    })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
-    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
@@ -619,7 +606,6 @@ test('summarizeTurn: transient failure is retried once and can succeed', async (
   // and prints a summary on the second: the retry must produce the summary
   // instead of an error. Node is the recorder so the test runs on Windows too
   // (no /bin/sh shebang dependency).
-  const prevCli = process.env.DSH_CLI
   const tmp = os.tmpdir()
   const counterFile = `${tmp}/memsearch-retrycount-${process.pid}.txt`
   const recorder = `${tmp}/memsearch-retry-recorder-${process.pid}.cjs`
@@ -635,34 +621,27 @@ test('summarizeTurn: transient failure is retried once and can succeed', async (
     'utf-8',
   )
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
-    const opts = {
-      summarizeMode: 'dsh-headless',
-      agentName: 'X',
-      summarizeProvider: '',
-      summarizeModel: '',
-      summarizeRetryBackoffMs: 0,
-    }
-    const ctx = { logger: { warn: () => {} } }
-    const summary = await summarizeTurn(ctx, opts, 'turn text', process.cwd())
-    assert.equal(summary, '- summarized on retry')
-    assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'exactly two attempts')
+    await withIsolatedEnv({ DSH_CLI: `${process.execPath} ${recorder}` }, async () => {
+      const opts = {
+        summarizeMode: 'dsh-headless',
+        agentName: 'X',
+        summarizeProvider: '',
+        summarizeModel: '',
+        summarizeRetryBackoffMs: 0,
+      }
+      const ctx = { logger: { warn: () => {} } }
+      const summary = await summarizeTurn(ctx, opts, 'turn text', process.cwd())
+      assert.equal(summary, '- summarized on retry')
+      assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'exactly two attempts')
+    })
   } finally {
     try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
     try { fs.unlinkSync(counterFile) } catch { /* cleanup */ }
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
   }
 })
 
 test('summarizeTurn: deterministic CLI-not-found failure is not retried', async () => {
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
-  try {
-    delete process.env.DSH_CLI
-    process.env.PATH = '/nonexistent'
-    process.env.HOME = '/nonexistent-home'
+  await withIsolatedEnv({ DSH_CLI: null, PATH: '/nonexistent', HOME: '/nonexistent-home' }, async () => {
     const warnings = []
     const ctx = { logger: { warn: (m) => warnings.push(m) } }
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeProvider: '', summarizeModel: '', summarizeRetryBackoffMs: 0 }
@@ -674,20 +653,16 @@ test('summarizeTurn: deterministic CLI-not-found failure is not retried', async 
       !warnings.some((w) => w.includes('retrying once')),
       `setup failure must not be retried: ${warnings}`,
     )
-  } finally {
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
-  }
+  })
 })
 
 test('summarizeTurn: summarizeTimeoutMs override times out a slow summarizer', async () => {
   // A node recorder that idles for 5 s: with summarizeTimeoutMs=200 each
   // attempt times out, the single retry fires, and the final error names the
   // timeout.
-  const prevCli = process.env.DSH_CLI
+  // A node recorder that idles for 5 s: with summarizeTimeoutMs=200 each
+  // attempt times out, the single retry fires, and the final error names the
+  // timeout.
   const tmp = os.tmpdir()
   const counterFile = `${tmp}/memsearch-slowcount-${process.pid}.txt`
   const recorder = `${tmp}/memsearch-slow-recorder-${process.pid}.cjs`
@@ -699,31 +674,29 @@ test('summarizeTurn: summarizeTimeoutMs override times out a slow summarizer', a
     'utf-8',
   )
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
-    const opts = {
-      summarizeMode: 'dsh-headless',
-      agentName: 'X',
-      summarizeProvider: '',
-      summarizeModel: '',
-      summarizeTimeoutMs: 200,
-      summarizeRetryBackoffMs: 0,
-    }
-    const ctx = { logger: { warn: () => {} } }
-    await assert.rejects(
-      summarizeTurn(ctx, opts, 'turn text', process.cwd()),
-      /timed out/,
-    )
-    assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'timeout retried once')
+    await withIsolatedEnv({ DSH_CLI: `${process.execPath} ${recorder}` }, async () => {
+      const opts = {
+        summarizeMode: 'dsh-headless',
+        agentName: 'X',
+        summarizeProvider: '',
+        summarizeModel: '',
+        summarizeTimeoutMs: 200,
+        summarizeRetryBackoffMs: 0,
+      }
+      const ctx = { logger: { warn: () => {} } }
+      await assert.rejects(
+        summarizeTurn(ctx, opts, 'turn text', process.cwd()),
+        /timed out/,
+      )
+      assert.equal(fs.readFileSync(counterFile, 'utf-8').trim(), '2', 'timeout retried once')
+    })
   } finally {
     try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
     try { fs.unlinkSync(counterFile) } catch { /* cleanup */ }
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
   }
 })
 
 test('summarizeHeadless: summarizeProfile is forwarded to the dsh CLI', async () => {
-  const prevCli = process.env.DSH_CLI
   const tmp = os.tmpdir()
   const argvFile = `${tmp}/memsearch-dsh-profile-argv-${process.pid}.json`
   const recorder = `${tmp}/memsearch-dsh-profile-recorder-${process.pid}.cjs`
@@ -734,25 +707,24 @@ test('summarizeHeadless: summarizeProfile is forwarded to the dsh CLI', async ()
     'utf-8',
   )
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
-    const opts = {
-      summarizeMode: 'dsh-headless',
-      agentName: 'X',
-      summarizeProvider: '',
-      summarizeModel: '',
-      summarizeProfile: 'memsearch-summary',
-    }
-    const ctx = { logger: { warn: () => {} } }
-    await summarizeTurn(ctx, opts, 'turn text', process.cwd())
-    const recorded = JSON.parse(fs.readFileSync(argvFile, 'utf-8'))
-    const profileIndex = recorded.indexOf('--profile')
-    assert.ok(profileIndex !== -1, `--profile present: ${JSON.stringify(recorded)}`)
-    assert.equal(recorded[profileIndex + 1], 'memsearch-summary', 'configured profile booted')
+    await withIsolatedEnv({ DSH_CLI: `${process.execPath} ${recorder}` }, async () => {
+      const opts = {
+        summarizeMode: 'dsh-headless',
+        agentName: 'X',
+        summarizeProvider: '',
+        summarizeModel: '',
+        summarizeProfile: 'memsearch-summary',
+      }
+      const ctx = { logger: { warn: () => {} } }
+      await summarizeTurn(ctx, opts, 'turn text', process.cwd())
+      const recorded = JSON.parse(fs.readFileSync(argvFile, 'utf-8'))
+      const profileIndex = recorded.indexOf('--profile')
+      assert.ok(profileIndex !== -1, `--profile present: ${JSON.stringify(recorded)}`)
+      assert.equal(recorded[profileIndex + 1], 'memsearch-summary', 'configured profile booted')
+    })
   } finally {
     try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
     try { fs.unlinkSync(argvFile) } catch { /* cleanup */ }
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
   }
 })
 
@@ -765,43 +737,31 @@ test('apply: summarize failure with summarizeFailureOutput:transcript preserves 
     skills: { register: () => {} },
     on: (name, fn) => { listeners[name] = fn },
   }
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevHome = process.env.HOME
-  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
-    delete process.env.DSH_CLI
-    delete process.env.MEMSEARCH_CMD
-    process.env.PATH = '/nonexistent'
-    process.env.HOME = '/nonexistent-home'
-    apply(ctx, { summarizeFailureOutput: 'transcript', summarizeRetryBackoffMs: 0 })
-    const session = {
-      id: 'session-failraw-test',
-      header: { cwd: projDir },
-      events: [
-        { type: 'turn/start', data: { turn: 1 } },
-        { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'important raw content fallback-marker-002' }] } },
-        { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
-        { type: 'turn/end', data: { turn: 1 } },
-      ],
-    }
-    await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
-    await new Promise((r) => setTimeout(r, 500))
-    const memoryDir = `${projDir}/.memsearch/memory`
-    const files = fs.readdirSync(memoryDir)
-    const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
-    assert.ok(content.includes('Summarization failed'), 'failure header written')
-    assert.ok(content.includes('fallback-marker-002'), 'raw turn preserved')
-    assert.ok(!content.includes('Memory summary unavailable'), 'default note wording not used')
-    assert.ok(content.includes('<!-- session:session-failraw-test turn:1 '), 'anchor preserved')
+    await withIsolatedEnv({ DSH_CLI: null, MEMSEARCH_CMD: null, PATH: '/nonexistent', HOME: '/nonexistent-home' }, async () => {
+      apply(ctx, { summarizeFailureOutput: 'transcript', summarizeRetryBackoffMs: 0 })
+      const session = {
+        id: 'session-failraw-test',
+        header: { cwd: projDir },
+        events: [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'important raw content fallback-marker-002' }] } },
+          { type: 'assistant/message', data: { message: { content: [{ type: 'text', text: 'ok' }] } } },
+          { type: 'turn/end', data: { turn: 1 } },
+        ],
+      }
+      await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
+      await new Promise((r) => setTimeout(r, 500))
+      const memoryDir = `${projDir}/.memsearch/memory`
+      const files = fs.readdirSync(memoryDir)
+      const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
+      assert.ok(content.includes('Summarization failed'), 'failure header written')
+      assert.ok(content.includes('fallback-marker-002'), 'raw turn preserved')
+      assert.ok(!content.includes('Memory summary unavailable'), 'default note wording not used')
+      assert.ok(content.includes('<!-- session:session-failraw-test turn:1 '), 'anchor preserved')
+    })
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevHome === undefined) delete process.env.HOME
-    else process.env.HOME = prevHome
-    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
@@ -815,50 +775,40 @@ test('apply: multi-project capture writes to each project memory dir', async () 
     skills: { register: () => {} },
     on: (name, fn) => { listeners[name] = fn },
   }
-  const prevCli = process.env.DSH_CLI
-  const prevPath = process.env.PATH
-  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
-    delete process.env.DSH_CLI
-    delete process.env.MEMSEARCH_CMD
-    process.env.PATH = '/nonexistent'
-    apply(ctx, { summarizeEnabled: false }) // raw writes, no CLI needed
-    const mkSession = (id, cwd, marker) => ({
-      id,
-      header: { cwd },
-      events: [
-        { type: 'turn/start', data: { turn: 1 } },
-        { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: marker }] } },
-        { type: 'turn/end', data: { turn: 1 } },
-      ],
+    await withIsolatedEnv({ DSH_CLI: null, MEMSEARCH_CMD: null, PATH: '/nonexistent' }, async () => {
+      apply(ctx, { summarizeEnabled: false }) // raw writes, no CLI needed
+      const mkSession = (id, cwd, marker) => ({
+        id,
+        header: { cwd },
+        events: [
+          { type: 'turn/start', data: { turn: 1 } },
+          { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: marker }] } },
+          { type: 'turn/end', data: { turn: 1 } },
+        ],
+      })
+      await listeners['session/event'](mkSession('session-a', projA, 'marker-proj-a'), { type: 'turn/end', data: { turn: 1 } })
+      await listeners['session/event'](mkSession('session-b', projB, 'marker-proj-b'), { type: 'turn/end', data: { turn: 1 } })
+      await new Promise((r) => setTimeout(r, 400))
+      const filesA = fs.readdirSync(`${projA}/.memsearch/memory`)
+      const filesB = fs.readdirSync(`${projB}/.memsearch/memory`)
+      assert.equal(filesA.length, 1, 'project A memory written')
+      assert.equal(filesB.length, 1, 'project B memory written')
+      const contentA = fs.readFileSync(`${projA}/.memsearch/memory/${filesA[0]}`, 'utf-8')
+      const contentB = fs.readFileSync(`${projB}/.memsearch/memory/${filesB[0]}`, 'utf-8')
+      assert.ok(contentA.includes('marker-proj-a'), 'A contains its own marker')
+      assert.ok(contentB.includes('marker-proj-b'), 'B contains its own marker')
+      assert.ok(!contentA.includes('marker-proj-b'), 'A does not leak B')
     })
-    await listeners['session/event'](mkSession('session-a', projA, 'marker-proj-a'), { type: 'turn/end', data: { turn: 1 } })
-    await listeners['session/event'](mkSession('session-b', projB, 'marker-proj-b'), { type: 'turn/end', data: { turn: 1 } })
-    await new Promise((r) => setTimeout(r, 400))
-    const filesA = fs.readdirSync(`${projA}/.memsearch/memory`)
-    const filesB = fs.readdirSync(`${projB}/.memsearch/memory`)
-    assert.equal(filesA.length, 1, 'project A memory written')
-    assert.equal(filesB.length, 1, 'project B memory written')
-    const contentA = fs.readFileSync(`${projA}/.memsearch/memory/${filesA[0]}`, 'utf-8')
-    const contentB = fs.readFileSync(`${projB}/.memsearch/memory/${filesB[0]}`, 'utf-8')
-    assert.ok(contentA.includes('marker-proj-a'), 'A contains its own marker')
-    assert.ok(contentB.includes('marker-proj-b'), 'B contains its own marker')
-    assert.ok(!contentA.includes('marker-proj-b'), 'A does not leak B')
   } finally {
     fs.rmSync(projA, { recursive: true, force: true })
     fs.rmSync(projB, { recursive: true, force: true })
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    process.env.PATH = prevPath
-    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
-test('apply: MEMSEARCH_DSH_SUMMARIZE=1 makes the plugin inert', () => {
-  const prev = process.env.MEMSEARCH_DSH_SUMMARIZE
+test('apply: MEMSEARCH_DSH_SUMMARIZE=1 makes the plugin inert', async () => {
   const listeners = {}
-  try {
-    process.env.MEMSEARCH_DSH_SUMMARIZE = '1'
+  await withIsolatedEnv({ MEMSEARCH_DSH_SUMMARIZE: '1' }, () => {
     const ctx = {
       logger: { warn: () => {}, debug: () => {} },
       skills: { register: () => {} },
@@ -866,10 +816,7 @@ test('apply: MEMSEARCH_DSH_SUMMARIZE=1 makes the plugin inert', () => {
     }
     apply(ctx, {})
     assert.deepEqual(listeners, {}, 'summarize sub-agent must register nothing')
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DSH_SUMMARIZE
-    else process.env.MEMSEARCH_DSH_SUMMARIZE = prev
-  }
+  })
 })
 
 test('apply: custom-llm config is honored in summarizeMode', async () => {
@@ -890,8 +837,6 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   // a real dsh boot here should not carry a memsearch-generated overlay file.
   // We point DSH_CLI at a recorder script that writes its argv to a file, then
   // assert the recorded args contain no `--patch` (and no temp overlay path).
-  const prevCli = process.env.DSH_CLI
-  const prevDshSummarize = process.env.MEMSEARCH_DSH_SUMMARIZE
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
   const recorder = `${tmp}/memsearch-dsh-argv-recorder-${process.pid}.cjs`
@@ -903,35 +848,34 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   )
   const argvFile = `${tmp}/memsearch-dsh-argv-${process.pid}.txt`
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
-    process.env.MEMSEARCH_ARGV_FILE = argvFile
-    const opts = {
-      summarizeMode: 'dsh-headless',
-      agentName: 'X',
-      summarizeProvider: 'deepseek-zilliz',
-      summarizeModel: 'deepseek-v4-pro',
-    }
-    const ctx = { logger: { warn: () => {} } }
-    const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
-    const summary = await summarizeTurn(ctx, opts, render, process.cwd())
-    assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
-    const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
-    assert.ok(
-      !recorded.includes('--patch'),
-      `headless summarize must not pass --patch; got argv: ${JSON.stringify(recorded)}`,
-    )
-    assert.ok(
-      !recorded.some((arg) => arg.includes('memsearch-dsh-summarize-')),
-      `headless summarize must not reference an overlay file; got argv: ${JSON.stringify(recorded)}`,
-    )
+    await withIsolatedEnv({
+      DSH_CLI: `${process.execPath} ${recorder}`,
+      MEMSEARCH_ARGV_FILE: argvFile,
+      MEMSEARCH_DSH_SUMMARIZE: null,
+    }, async () => {
+      const opts = {
+        summarizeMode: 'dsh-headless',
+        agentName: 'X',
+        summarizeProvider: 'deepseek-zilliz',
+        summarizeModel: 'deepseek-v4-pro',
+      }
+      const ctx = { logger: { warn: () => {} } }
+      const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
+      const summary = await summarizeTurn(ctx, opts, render, process.cwd())
+      assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
+      const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
+      assert.ok(
+        !recorded.includes('--patch'),
+        `headless summarize must not pass --patch; got argv: ${JSON.stringify(recorded)}`,
+      )
+      assert.ok(
+        !recorded.some((arg) => arg.includes('memsearch-dsh-summarize-')),
+        `headless summarize must not reference an overlay file; got argv: ${JSON.stringify(recorded)}`,
+      )
+    })
   } finally {
     try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
     try { fs.unlinkSync(argvFile) } catch { /* cleanup */ }
-    delete process.env.MEMSEARCH_ARGV_FILE
-    if (prevCli === undefined) delete process.env.DSH_CLI
-    else process.env.DSH_CLI = prevCli
-    if (prevDshSummarize === undefined) delete process.env.MEMSEARCH_DSH_SUMMARIZE
-    else process.env.MEMSEARCH_DSH_SUMMARIZE = prevDshSummarize
   }
 })
 
@@ -1011,7 +955,53 @@ test('writeCapture: quality tag lands in the anchor without breaking dedup', () 
   }
 })
 
-test('runQualityGate: parses verdict, passes --recent-file when the journal exists', (t) => {
+test('filterDiagnosticFields: retains metadata and discards payload fields', () => {
+  assert.deepEqual(filterDiagnosticFields({
+    sessionId: 'session-a',
+    turn: 2,
+    prompt: 'secret prompt',
+    transcript: 'secret transcript',
+    summary: 'secret summary',
+    chunks: ['secret chunk'],
+    errorText: 'secret error',
+    timestamp: 'overridden',
+    event: 'overridden',
+  }), { sessionId: 'session-a', turn: 2 })
+})
+
+test('runQualityGate: reports disabled separately from command failure', () => {
+  const dir = fs.mkdtempSync(`${os.tmpdir()}/memsearch-quality-status-`)
+  const modeFile = join(dir, 'mode.txt')
+  const shim = join(dir, 'quality-status.cjs')
+  fs.writeFileSync(
+    shim,
+    [
+      'const fs = require("node:fs")',
+      `const mode = fs.readFileSync(${JSON.stringify(modeFile)}, "utf-8")`,
+      'if (process.argv[2] === "config") { process.stdout.write(mode === "disabled" ? "false" : "true"); process.exit(0) }',
+      'process.exit(7)',
+    ].join('\n'),
+  )
+  try {
+    fs.writeFileSync(modeFile, 'disabled')
+    let status
+    assert.equal(runQualityGate([process.execPath, shim], 'body', dir, undefined, (value) => { status = value }), null)
+    assert.equal(status, 'disabled')
+
+    fs.writeFileSync(modeFile, 'failed')
+    let errorType
+    assert.equal(runQualityGate([process.execPath, shim], 'body', dir, undefined, (value, type) => {
+      status = value
+      errorType = type
+    }), null)
+    assert.equal(status, 'failed')
+    assert.equal(typeof errorType, 'string')
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true })
+  }
+})
+
+test('runQualityGate: parses verdict, passes --recent-file when the journal exists', async (t) => {
   // The gate shells out through bash; when no usable bash exists (e.g. the
   // WSL default distro has no coreutils), skip — the pre-existing
   // bash-dependent tests fail the same way on such hosts.
@@ -1041,11 +1031,8 @@ test('runQualityGate: parses verdict, passes --recent-file when the journal exis
     fs.chmodSync(`${binDir}/fake-memsearch`, 0o755)
     const argsFile = `${dir}/args.txt`
     fs.writeFileSync(argsFile, '')
-    const prevPath = process.env.PATH
-    process.env.PATH = `${binDir}:${prevPath}`
-    process.env.CAPTURE_ARGS = argsFile
     let sawRecent = false
-    try {
+    await withIsolatedEnv({ PATH: `${binDir}:${process.env.PATH}`, CAPTURE_ARGS: argsFile }, () => {
       const verdict = runQualityGate('fake-memsearch', 'candidate body', memoryDir, undefined)
       assert.deepEqual(verdict, { action: 'degrade', score: 45 })
       const args = fs.readFileSync(argsFile, 'utf-8')
@@ -1058,17 +1045,14 @@ test('runQualityGate: parses verdict, passes --recent-file when the journal exis
       const verdict2 = runQualityGate('fake-memsearch', 'candidate body', memoryDir, undefined)
       assert.equal(verdict2.action, 'degrade')
       sawRecent = fs.readFileSync(argsFile, 'utf-8').includes('--recent-file')
-    } finally {
-      process.env.PATH = prevPath
-      delete process.env.CAPTURE_ARGS
-    }
+    })
     assert.ok(sawRecent, 'recent flag passed once journal exists')
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('runQualityGate: fails open (null) when the CLI has no quality subcommand', (t) => {
+test('runQualityGate: fails open (null) when the CLI has no quality subcommand', async (t) => {
   try {
     execFileSync('bash', ['-c', 'true'], { stdio: 'ignore' })
   } catch {
@@ -1083,31 +1067,22 @@ test('runQualityGate: fails open (null) when the CLI has no quality subcommand',
     fs.mkdirSync(binDir, { recursive: true })
     fs.writeFileSync(`${binDir}/old-memsearch`, '#!/usr/bin/env bash\nexit 1\n')
     fs.chmodSync(`${binDir}/old-memsearch`, 0o755)
-    const prevPath = process.env.PATH
-    process.env.PATH = `${binDir}:${prevPath}`
-    try {
+    await withIsolatedEnv({ PATH: `${binDir}:${process.env.PATH}` }, () => {
       const warnings = []
       assert.equal(runQualityGate('old-memsearch', 'body', memoryDir, { warn: (m) => warnings.push(m) }), null)
       assert.equal(warnings.length, 1, 'warns once on gate failure')
-    } finally {
-      process.env.PATH = prevPath
-    }
+    })
   } finally {
     fs.rmSync(dir, { recursive: true, force: true })
   }
 })
 
-test('memsearchDirFor: MEMSEARCH_DIR env wins (global scope)', () => {
-  const prev = process.env.MEMSEARCH_DIR
-  try {
-    process.env.MEMSEARCH_DIR = '/global/memsearch'
+test('memsearchDirFor: MEMSEARCH_DIR env wins (global scope)', async () => {
+  await withIsolatedEnv({ MEMSEARCH_DIR: '/global/memsearch' }, () => {
     assert.equal(memsearchDirFor('/proj/x'), '/global/memsearch')
     delete process.env.MEMSEARCH_DIR
     assert.equal(memsearchDirFor('/proj/x'), join('/proj/x', '.memsearch'))
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
 
 test('apply: injectEnabled:false makes pre-step injection a no-op', async () => {
@@ -1127,8 +1102,37 @@ test('apply: injectEnabled:false makes pre-step injection a no-op', async () => 
   assert.equal(result.messages.length, 1, 'no memory message injected')
 })
 
+test('apply: diagnostics do not create .memsearch in a project without memory', async () => {
+  const projectDir = fs.mkdtempSync(`${os.tmpdir()}/memsearch-no-memory-`)
+  const listeners = {}
+  let disposeDiagnostics = async () => {}
+  const ctx = {
+    logger: { warn: () => {}, debug: () => {} },
+    skills: { register: () => {} },
+    on: (name, fn) => { listeners[name] = fn },
+    effect: (setup) => { disposeDiagnostics = setup() },
+  }
+  try {
+    await withIsolatedEnv({ MEMSEARCH_CMD: null, PATH: '/nonexistent' }, async () => {
+      apply(ctx, { captureEnabled: false, diagnosticLogEnabled: true })
+      const decision = { kind: 'enter', messages: [{ role: 'user', content: [{ type: 'text', text: 'recall something' }] }] }
+      const result = await listeners['agent/pre-step'](
+        { agent: { session: { header: { cwd: projectDir } } }, turn: 1, step: 1, signal: {} },
+        async () => decision,
+      )
+      assert.equal(result, decision)
+      await new Promise((resolve) => setTimeout(resolve, 25))
+      await disposeDiagnostics()
+      assert.equal(fs.existsSync(join(projectDir, '.memsearch')), false)
+    })
+  } finally {
+    await disposeDiagnostics()
+    fs.rmSync(projectDir, { recursive: true, force: true })
+  }
+})
+
 test('apply: empty search result keeps pre-step context unchanged while recall stays available', async () => {
-  await withInjectionFixture([], async ({ result, unchanged, registeredSkillNames, callLog }) => {
+  await withInjectionFixture([], async ({ result, unchanged, registeredSkillNames, callLog, diagnosticLog }) => {
     assert.equal(unchanged, true, 'empty search result must not inject a marker')
     assert.equal(result.messages.length, 1)
     assert.ok(
@@ -1140,13 +1144,15 @@ test('apply: empty search result keeps pre-step context unchanged while recall s
     assert.equal(searches.length, 1)
     assert.ok(searches[0].includes('--default-collection '))
     assert.ok(!searches[0].includes('--collection '))
-  })
+    assert.ok(diagnosticLog.includes('"event":"recall.search.started"'))
+    assert.ok(diagnosticLog.includes('"event":"recall.search.empty"'))
+  }, false, true)
 })
 
 test('apply: returned chunks inject one retrieved-context marker with plugin source metadata', async () => {
   await withInjectionFixture(
     [{ source: 'memory/2026-09-07.md:4', content: 'The release marker is PINE-NEBULA-8643.' }],
-    async ({ result, unchanged, registeredSkillNames, callLog }) => {
+    async ({ result, unchanged, registeredSkillNames, callLog, diagnosticLog }) => {
       assert.equal(unchanged, false)
       assert.equal(result.kind, 'enter')
       assert.equal(result.messages.length, 2)
@@ -1170,7 +1176,12 @@ test('apply: returned chunks inject one retrieved-context marker with plugin sou
       assert.equal(searches.length, 1)
       assert.ok(searches[0].includes('--default-collection '))
       assert.ok(!searches[0].includes('--collection '))
+      assert.ok(diagnosticLog.includes('"event":"recall.search.started"'))
+      assert.ok(diagnosticLog.includes('"event":"recall.injected"'))
+      assert.ok(!diagnosticLog.includes('PINE-NEBULA-8643'), 'diagnostics exclude retrieved content')
     },
+    false,
+    true,
   )
 })
 
@@ -1288,9 +1299,7 @@ test('registerSkillReviewRoutes: GET candidates returns parsed list, pending fir
   }
   const { registerSkillReviewRoutes } = await import('../index.js')
   // memsearchDirFor reads MEMSEARCH_DIR env; point it at the temp dir.
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
-  try {
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, () => {
     registerSkillReviewRoutes(ctx, webServer, 'memsearch')
     const getRoute = routes['/memsearch-dsh/skill-candidates']
     assert.ok(getRoute, 'GET route registered')
@@ -1299,10 +1308,7 @@ test('registerSkillReviewRoutes: GET candidates returns parsed list, pending fir
     assert.equal(res.status, 200)
     assert.deepEqual(res.body.candidates.map((c) => c.name), ['alpha', 'zeta'], 'pending first')
     assert.equal(res.body.candidates[0].description, 'A')
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
 
 test('registerSkillReviewRoutes: GET rejects non-GET, POST review injects into agent inbox', async () => {
@@ -1318,9 +1324,7 @@ test('registerSkillReviewRoutes: GET rejects non-GET, POST review injects into a
     logger: { warn: () => {} },
   }
   const { registerSkillReviewRoutes } = await import('../index.js')
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
-  try {
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, async () => {
     registerSkillReviewRoutes(ctx, webServer, 'memsearch')
     const getRoute = routes['/memsearch-dsh/skill-candidates']
     const res = { writeHead: (s) => { res.status = s }, end: (b) => { res.body = JSON.parse(b) } }
@@ -1340,10 +1344,7 @@ test('registerSkillReviewRoutes: GET rejects non-GET, POST review injects into a
     assert.ok(appended, 'inbox append called')
     assert.equal(appended.target, 'next-turn')
     assert.ok(appended.msg.content[0].text.startsWith('[memsearch] Skill candidate "alpha"'), 'message text')
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
 
 test('registerSkillReviewRoutes: POST review with unknown session returns 404', async () => {
@@ -1352,9 +1353,7 @@ test('registerSkillReviewRoutes: POST review with unknown session returns 404', 
   const webServer = { register: (r) => { routes[r.path] = r } }
   const ctx = { agents: { get: () => undefined }, logger: { warn: () => {} } }
   const { registerSkillReviewRoutes } = await import('../index.js')
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
-  try {
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, async () => {
     registerSkillReviewRoutes(ctx, webServer, 'memsearch')
     const postRoute = routes['/memsearch-dsh/skill-review']
     const { EventEmitter } = await import('node:events')
@@ -1365,10 +1364,7 @@ test('registerSkillReviewRoutes: POST review with unknown session returns 404', 
     req.emit('end')
     await done
     assert.equal(pr.status, 404)
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
 
 test('registerSkillReviewRoutes: POST open-memsearch opens existing dir, 404 for missing', async () => {
@@ -1382,41 +1378,36 @@ test('registerSkillReviewRoutes: POST open-memsearch opens existing dir, 404 for
     logger: { warn: (m) => { opened = m } },
   }
   const { registerSkillReviewRoutes } = await import('../index.js')
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
   const { execFile } = await import('node:child_process')
   // stub execFile so xdg-open doesn't actually fire
   const { registerSkillReviewRoutes: real } = await import('../index.js')
-  try {
-    registerSkillReviewRoutes(ctx, webServer, 'memsearch')
-    const route = routes['/memsearch-dsh/open-memsearch']
-    assert.ok(route, 'open-memsearch route registered')
-    const { EventEmitter } = await import('node:events')
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, async () => {
+      registerSkillReviewRoutes(ctx, webServer, 'memsearch')
+      const route = routes['/memsearch-dsh/open-memsearch']
+      assert.ok(route, 'open-memsearch route registered')
+      const { EventEmitter } = await import('node:events')
 
-    // existing dir
-    const req1 = Object.assign(new EventEmitter(), { method: 'POST' })
-    const res1 = { writeHead: (s) => { res1.status = s }, end: (b) => { res1.body = JSON.parse(b) } }
-    const done1 = route.handler(req1, res1)
-    req1.emit('data', JSON.stringify({ sessionId: 'sess-1', scope: 'memsearch' }))
-    req1.emit('end')
-    await done1
-    assert.equal(res1.status, 200)
-    assert.equal(res1.body.ok, true)
-    assert.equal(res1.body.path, tmp, 'path is the memsearch dir (MEMSEARCH_DIR override)')
+      // existing dir
+      const req1 = Object.assign(new EventEmitter(), { method: 'POST' })
+      const res1 = { writeHead: (s) => { res1.status = s }, end: (b) => { res1.body = JSON.parse(b) } }
+      const done1 = route.handler(req1, res1)
+      req1.emit('data', JSON.stringify({ sessionId: 'sess-1', scope: 'memsearch' }))
+      req1.emit('end')
+      await done1
+      assert.equal(res1.status, 200)
+      assert.equal(res1.body.ok, true)
+      assert.equal(res1.body.path, tmp, 'path is the memsearch dir (MEMSEARCH_DIR override)')
 
-    // missing dir
-    const req2 = Object.assign(new EventEmitter(), { method: 'POST' })
-    const res2 = { writeHead: (s) => { res2.status = s }, end: (b) => { res2.body = JSON.parse(b) } }
-    const done2 = route.handler(req2, res2)
-    req2.emit('data', JSON.stringify({ sessionId: 'sess-1', scope: 'candidates' }))
-    req2.emit('end')
-    await done2
-    assert.equal(res2.status, 404)
-    assert.equal(res2.body.ok, false)
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+      // missing dir
+      const req2 = Object.assign(new EventEmitter(), { method: 'POST' })
+      const res2 = { writeHead: (s) => { res2.status = s }, end: (b) => { res2.body = JSON.parse(b) } }
+      const done2 = route.handler(req2, res2)
+      req2.emit('data', JSON.stringify({ sessionId: 'sess-1', scope: 'candidates' }))
+      req2.emit('end')
+      await done2
+      assert.equal(res2.status, 404)
+      assert.equal(res2.body.ok, false)
+  })
 })
 
 test('registerSkillReviewRoutes: list-memsearch lists dirs/files, blocks traversal', async () => {
@@ -1440,9 +1431,7 @@ test('registerSkillReviewRoutes: list-memsearch lists dirs/files, blocks travers
   const webServer = { register: (r) => { routes[r.path] = r } }
   const ctx = { agents: { get: () => undefined }, logger: { warn: () => {} } }
   const { registerSkillReviewRoutes } = await import('../index.js')
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
-  try {
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, () => {
     registerSkillReviewRoutes(ctx, webServer, 'memsearch')
     const route = routes['/memsearch-dsh/list-memsearch']
     assert.ok(route, 'list route registered')
@@ -1465,10 +1454,7 @@ test('registerSkillReviewRoutes: list-memsearch lists dirs/files, blocks travers
       route.handler({ method: 'GET', url: '/memsearch-dsh/list-memsearch?path=outside-link' }, res3)
       assert.equal(res3.status, 400)
     }
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
 
 test('registerSkillReviewRoutes: read-file serves text, rejects binary/traversal/oversize', async () => {
@@ -1491,9 +1477,7 @@ test('registerSkillReviewRoutes: read-file serves text, rejects binary/traversal
   const webServer = { register: (r) => { routes[r.path] = r } }
   const ctx = { agents: { get: () => undefined }, logger: { warn: () => {} } }
   const { registerSkillReviewRoutes } = await import('../index.js')
-  const prev = process.env.MEMSEARCH_DIR
-  process.env.MEMSEARCH_DIR = tmp
-  try {
+  await withIsolatedEnv({ MEMSEARCH_DIR: tmp }, () => {
     registerSkillReviewRoutes(ctx, webServer, 'memsearch')
     const route = routes['/memsearch-dsh/read-file']
     assert.ok(route, 'read route registered')
@@ -1520,8 +1504,5 @@ test('registerSkillReviewRoutes: read-file serves text, rejects binary/traversal
       route.handler({ method: 'GET', url: '/memsearch-dsh/read-file?path=escape.md' }, res4)
       assert.equal(res4.status, 400)
     }
-  } finally {
-    if (prev === undefined) delete process.env.MEMSEARCH_DIR
-    else process.env.MEMSEARCH_DIR = prev
-  }
+  })
 })
