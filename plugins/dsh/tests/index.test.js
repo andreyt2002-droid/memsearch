@@ -608,6 +608,47 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   }
 })
 
+test('summarizeHeadless: child receives EOF on stdin and does not hang', async () => {
+  // The spawned dsh child must not be left waiting on an open stdin pipe:
+  // a child (or wrapper script) that reads stdin to EOF would otherwise hang
+  // until the summarize timeout kills it. Point DSH_CLI at a Node recorder
+  // that exits only after stdin ends, then assert it completed promptly.
+  const prevCli = process.env.DSH_CLI
+  const prevDshSummarize = process.env.MEMSEARCH_DSH_SUMMARIZE
+  const tmp = os.tmpdir()
+  const recorder = `${tmp}/memsearch-dsh-stdin-eof-${process.pid}.mjs`
+  const markerFile = `${tmp}/memsearch-dsh-stdin-eof-${process.pid}.txt`
+  fs.writeFileSync(
+    recorder,
+    'import { writeFileSync } from "node:fs";\n' +
+      'process.stdin.resume();\n' +
+      `process.stdin.once("end", () => { writeFileSync(${JSON.stringify(markerFile)}, "eof"); process.exit(0); });\n` +
+      'setTimeout(() => process.exit(4), 25000).unref();\n',
+    'utf-8',
+  )
+  try {
+    // detectDshCmd splits DSH_CLI on whitespace; quote the interpreter path is
+    // not needed because process.execPath and tmpdir contain no spaces here.
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    const opts = { summarizeMode: 'dsh-headless', agentName: 'X' }
+    const ctx = { logger: { warn: () => {} } }
+    const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
+    const started = Date.now()
+    const summary = await summarizeTurn(ctx, opts, render, process.cwd())
+    const elapsed = Date.now() - started
+    assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
+    assert.ok(elapsed < 20000, `recorder should exit on stdin EOF, took ${elapsed}ms`)
+    assert.equal(fs.readFileSync(markerFile, 'utf-8'), 'eof', 'stdin EOF reached the child')
+  } finally {
+    try { fs.unlinkSync(recorder) } catch { /* cleanup */ }
+    try { fs.unlinkSync(markerFile) } catch { /* cleanup */ }
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    if (prevDshSummarize === undefined) delete process.env.MEMSEARCH_DSH_SUMMARIZE
+    else process.env.MEMSEARCH_DSH_SUMMARIZE = prevDshSummarize
+  }
+})
+
 test('renderTurn: renders user/assistant/tool events into the shared format', () => {
   const session = {
     events: [
@@ -634,6 +675,31 @@ test('renderTurn: returns null when no user message', () => {
     ],
   }
   assert.equal(renderTurn(session, { data: { turn: 1 } }), null)
+})
+
+test('renderTurn: prefers session.snapshotEvents() over the legacy events array', () => {
+  // Newer DSH Session replaced the public `events` array with an immutable
+  // snapshotEvents() projection; when both are present the snapshot wins.
+  const session = {
+    events: [
+      { type: 'turn/start', data: { turn: 2 } },
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'stale legacy events' }] } },
+      { type: 'turn/end', data: { turn: 2 } },
+    ],
+    snapshotEvents: () => [
+      { type: 'turn/start', data: { turn: 2 } },
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'snapshot capture marker' }] } },
+      { type: 'turn/end', data: { turn: 2 } },
+    ],
+  }
+  const render = renderTurn(session, { data: { turn: 2 } })
+  assert.ok(render.includes('snapshot capture marker'), 'uses snapshotEvents instead of the removed events array')
+  assert.ok(!render.includes('stale legacy events'), 'legacy array is not read when snapshotEvents exists')
+})
+
+test('renderTurn: returns null when neither snapshotEvents nor events is available', () => {
+  assert.equal(renderTurn({}, { data: { turn: 1 } }), null)
+  assert.equal(renderTurn({ snapshotEvents: () => null }, { data: { turn: 1 } }), null)
 })
 
 test('writeCapture + captureExists: writes shared format and dedups', () => {

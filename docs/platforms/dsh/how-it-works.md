@@ -25,7 +25,7 @@ flowchart LR
 The plugin listens for DSH `session/event` notifications and handles completed turns. It:
 
 1. resolves the durable project directory from the session;
-2. renders user, assistant, and tool activity into a bounded transcript;
+2. renders user, assistant, and tool activity into a bounded transcript, reading the event log through `session.snapshotEvents()` (falling back to the legacy `session.events` array on older hosts);
 3. summarizes the turn without blocking the active conversation;
 4. appends the result to `.memsearch/memory/YYYY-MM-DD.md` with a session anchor;
 5. lets the shared MemSearch index make the new entry searchable.
@@ -55,7 +55,7 @@ The same markdown journal can contain entries produced by Claude Code, Codex, DS
 `summarizeMode` selects the capture backend:
 
 - **`auto`** (default) uses a configured `[plugins.dsh.summarize]` provider when present; otherwise it uses `dsh-headless`.
-- **`dsh-headless`** starts a one-shot headless DSH agent using the model selected by the DSH deployment. The child process disables the MemSearch plugin to prevent recursive capture.
+- **`dsh-headless`** starts a one-shot headless DSH agent using the model selected by the DSH deployment. The child process is spawned with a closed stdin (immediate EOF) so nothing waits on an open pipe, and disables the MemSearch plugin to prevent recursive capture.
 - **`custom-llm`** calls a provider from the shared MemSearch configuration directly, which is useful for assigning a small dedicated summarization model.
 
 There is no silent fallback to a different backend. If the selected summarizer is unavailable, the journal records a short unavailable note with the original transcript anchor instead of writing an unsummarized conversation dump.

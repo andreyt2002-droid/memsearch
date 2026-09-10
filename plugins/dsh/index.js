@@ -764,7 +764,14 @@ function sessionLogPath(ctx, session) {
  */
 function renderTurn(session, turnEndEvent) {
   const turn = turnEndEvent.data.turn
-  const events = session.events
+  // DSH Session replaced its public `events` array with `snapshotEvents()`.
+  // Prefer the current immutable projection while retaining compatibility with
+  // older hosts that still expose the array. Without either, capture skips the
+  // turn rather than throwing into the event listener.
+  const events = typeof session.snapshotEvents === 'function'
+    ? session.snapshotEvents()
+    : session.events
+  if (!Array.isArray(events)) return null
   const startIndex = events.findIndex(
     (event) => event.type === 'turn/start' && event.data.turn === turn,
   )
@@ -943,6 +950,10 @@ function summarizeHeadless(ctx, opts, render, projectDir) {
     const child = spawn(dshCmd[0], [...dshCmd.slice(1), ...args], {
       cwd: projectDir,
       env: { ...process.env, MEMSEARCH_DSH_SUMMARIZE: '1' },
+      // The child never reads stdin: give it an immediately-closed stream so
+      // anything waiting for EOF (the dsh CLI or a wrapper script) is not left
+      // hanging on an open pipe until the timeout kills the process.
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
     let stdout = ''
     let stderr = ''
