@@ -49,12 +49,20 @@ python3 {{PLUGIN_DIR}}/scripts/parse-transcript.py --db "<path>" --turn <N> --co
 
 Pass `--context 0` for just the target turn, or omit `--turn` to see the most recent turns.
 
-### 4. Report a curated summary
+### 4. Fallback: CLI or embeddings unavailable
+
+If the search command fails outright — the CLI is not found, exits non-zero, times out, or reports an embedding-provider error (Ollama/OpenAI/ONNX unreachable) — do not report "no memories": the markdown journal is the source of truth and stays readable without any CLI or index.
+
+- Keyword-scan the raw journal: `grep -ril "<keywords>" "{{PROJECT_DIR}}/.memsearch/memory/"` (newest days first; files are named `YYYY-MM-DD.md`).
+- Read the matching days; entries are `### HH:MM` sections with `<!-- session:... turn:... -->` anchors usable as provenance markers.
+- Skip `expand`/transcript steps (they need the CLI), and note in the summary that recall ran in degraded raw-markdown mode (keyword match, no semantic ranking).
+
+### 5. Report a curated summary
 
 Return a concise summary of the relevant context to the user, citing the memory source files where useful. If the search finds nothing relevant, say so plainly in one line and proceed without it. Do not fabricate memories.
 
 ## Notes
 
-- The memory store is plain markdown under `<project>/.memsearch/memory/YYYY-MM-DD.md`. Milvus is a derived search index; a chunk may be indexed slightly behind the markdown source.
+- The memory store is plain markdown under `<project>/.memsearch/memory/YYYY-MM-DD.md`. Milvus is a derived search index; a chunk may be indexed slightly behind the markdown source. When the CLI or the embedding provider is unavailable, read the markdown directly (see step 4).
 - If `memsearch` is not on PATH, prefix with the detected command `{{MEMSEARCH_CMD}}` (which may be `uvx --from 'memsearch[onnx]' memsearch`).
 - Prefer the final, user-facing outcome over raw transcript detail.

@@ -41,6 +41,17 @@ If the user's question is vague or you can't form a concrete search query, explo
 
 Once a concrete topic jumps out, go back to `memsearch search` with a specific query.
 
+## Fallback: CLI or embeddings unavailable
+
+If `memsearch search` fails outright — the command is not found even via `uvx`, it exits non-zero, times out, or reports an embedding-provider error (Ollama/OpenAI/ONNX unreachable) — do not give up and do not report "no memories": the markdown journal is the source of truth and stays readable without any CLI or index.
+
+Degrade to a keyword scan over the raw journal and read the matches newest-first:
+
+- `grep -ril "<keywords>" .memsearch/memory/ | sort -r | head -10` — days mentioning the topic
+- Read the matching `YYYY-MM-DD.md` files; entries are `### HH:MM` sections with `<!-- session:... turn:... -->` anchors.
+- Skip `expand`/`transcript` steps (they need the CLI); anchors remain useful as provenance markers.
+- In the final summary, note that recall ran in degraded raw-markdown mode (keyword match, no semantic ranking).
+
 ## Output Format
 
 Organize by relevance. For each memory include:

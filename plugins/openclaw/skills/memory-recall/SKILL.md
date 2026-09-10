@@ -41,6 +41,7 @@ Parses the original session transcript to retrieve the raw dialogue.
 - memory_get may reveal `<!-- session:UUID transcript:PATH -->` anchors — pass the path to memory_transcript
 - If memory_search returns no results, try rephrasing with different keywords
 - Results are sorted by relevance (hybrid BM25 + vector search)
+- If the memory tools error out entirely (MCP server down, embedding provider unreachable), fall back to reading the raw journal directly: it lives at `<project>/.memsearch/memory/YYYY-MM-DD.md`, entries are `### HH:MM` sections with `<!-- session:... turn:... -->` anchors. A keyword scan over those files is a valid degraded recall — note in the summary that it ran without semantic ranking.
 
 ## When unsure what to search
 
