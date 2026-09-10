@@ -33,6 +33,7 @@ import { execFile, execFileSync, spawn } from 'node:child_process'
 import { createHash } from 'node:crypto'
 import {
   appendFileSync,
+  promises as fsPromises,
   existsSync,
   mkdirSync,
   readFileSync,
@@ -68,7 +69,10 @@ const SUMMARIZE_HEADLESS_TIMEOUT_MS = 120000
 const SUMMARIZE_RETRY_BACKOFF_MS = 2000
 const CAPTURE_MAX_CHARS = 6000
 const INJECT_SNIPPET_CHARS = 180
+const DEFAULT_DIAGNOSTIC_LOG_RETENTION_DAYS = 14
+const DEFAULT_DIAGNOSTIC_LOG_DRAIN_TIMEOUT_MS = 2000
 const DAILY_FILE_RE = /^\d{4}-\d{2}-\d{2}\.md$/
+const DIAGNOSTIC_LOG_FILE_RE = /^dsh-events-(\d{4}-\d{2}-\d{2})\.jsonl$/
 const MAINTENANCE_INTERVAL_MS = 6 * 60 * 60 * 1000 // 6h; runner's due-state gates actual runs
 
 // ---------------------------------------------------------------------------
@@ -421,6 +425,90 @@ function hhmmStr() {
   return `${pad(now.getHours())}:${pad(now.getMinutes())}`
 }
 
+const DIAGNOSTIC_FIELD_NAMES = new Set([
+  'action',
+  'collection',
+  'durationMs',
+  'errorType',
+  'fallback',
+  'mode',
+  'quality',
+  'reason',
+  'resultCount',
+  'score',
+  'sessionId',
+  'stage',
+  'turn',
+])
+
+/** Retain only approved scalar metadata fields for a diagnostic event. */
+function filterDiagnosticFields(fields) {
+  const filtered = {}
+  for (const [key, value] of Object.entries(fields)) {
+    if (!DIAGNOSTIC_FIELD_NAMES.has(key)) continue
+    if (value === null || ['string', 'number', 'boolean'].includes(typeof value)) filtered[key] = value
+  }
+  return filtered
+}
+
+/** Remove diagnostic files older than the configured UTC-day window. */
+async function pruneDiagnosticLogs(logDir, retentionDays) {
+  let files
+  try {
+    files = await fsPromises.readdir(logDir)
+  } catch {
+    return
+  }
+  const cutoff = new Date()
+  cutoff.setUTCHours(0, 0, 0, 0)
+  cutoff.setUTCDate(cutoff.getUTCDate() - retentionDays + 1)
+  for (const file of files) {
+    const match = DIAGNOSTIC_LOG_FILE_RE.exec(file)
+    if (!match || Date.parse(`${match[1]}T00:00:00Z`) >= cutoff.getTime()) continue
+    try {
+      await fsPromises.unlink(join(logDir, file))
+    } catch {
+      // Retention is best-effort; inability to delete an old file must not
+      // suppress the current diagnostic event.
+    }
+  }
+}
+
+/**
+ * Append one content-free diagnostic event under `.memsearch/logs/`.
+ *
+ * Logging is best-effort and never creates the owning `.memsearch` directory.
+ * Only allowlisted scalar metadata is serialized; payload text and arbitrary
+ * caller fields are discarded.
+ *
+ * @returns `written`, `missing`, or `failed`.
+ */
+async function writeDiagnosticEvent(memsearchDir, event, fields = {}, options = {}) {
+  if (!options.isActive()) return 'abandoned'
+  const logDir = join(memsearchDir, 'logs')
+  try {
+    await fsPromises.mkdir(logDir)
+  } catch (error) {
+    if (error?.code === 'ENOENT') return 'missing'
+    if (error?.code !== 'EEXIST') return 'failed'
+  }
+  try {
+    if (!options.isActive()) return 'abandoned'
+    if (options.prune) await pruneDiagnosticLogs(logDir, options.retentionDays)
+    if (!options.isActive()) return 'abandoned'
+    const record = { ...filterDiagnosticFields(fields), timestamp: new Date().toISOString(), event }
+    await fsPromises.appendFile(join(logDir, `dsh-events-${todayStr()}.jsonl`), `${JSON.stringify(record)}\n`, 'utf-8')
+    return 'written'
+  } catch {
+    return 'failed'
+  }
+}
+
+/** Stable, content-free error category for diagnostics. */
+function diagnosticErrorType(error) {
+  return typeof error?.code === 'string' ? error.code : error?.name || 'Error'
+}
+
 // ---------------------------------------------------------------------------
 // Search / index (memsearch CLI)
 // ---------------------------------------------------------------------------
@@ -430,7 +518,7 @@ function hhmmStr() {
  * @returns the parsed result array, or null on any failure (caller treats
  *          null as "no injectable context" and stays a no-op).
  */
-function runSearch(memsearchCmd, query, collection, projectDir, milvusUri) {
+function runSearch(memsearchCmd, query, collection, projectDir, milvusUri, onFailure) {
   return new Promise((resolve) => {
     const args = [
       'search', query,
@@ -444,11 +532,16 @@ function runSearch(memsearchCmd, query, collection, projectDir, milvusUri) {
       args,
       { cwd: projectDir, timeout: SEARCH_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024 },
       (error, stdout) => {
-        if (error) return resolve(null)
+        if (error) {
+          onFailure?.('command', diagnosticErrorType(error))
+          return resolve(null)
+        }
         try {
           const chunks = JSON.parse(stdout)
+          if (!Array.isArray(chunks)) onFailure?.('response', 'UnexpectedResult')
           resolve(Array.isArray(chunks) ? chunks : null)
-        } catch {
+        } catch (parseError) {
+          onFailure?.('response', diagnosticErrorType(parseError))
           resolve(null)
         }
       },
@@ -457,7 +550,7 @@ function runSearch(memsearchCmd, query, collection, projectDir, milvusUri) {
 }
 
 /** Fire-and-forget `memsearch index` refresh for a project. */
-function indexMemory(ctx, memsearchCmd, memoryDir, collection, projectDir, milvusUri) {
+function indexMemory(ctx, memsearchCmd, memoryDir, collection, projectDir, milvusUri, onComplete) {
   if (!existsSync(memoryDir)) return
   const args = [
     'index', memoryDir,
@@ -476,6 +569,7 @@ function indexMemory(ctx, memsearchCmd, memoryDir, collection, projectDir, milvu
     env: { ...process.env, MEMSEARCH_NO_WATCH: '1' },
   }, (error) => {
     if (error) ctx.logger.warn(`[memsearch] background index failed: ${error.message}`)
+    onComplete?.(error ? diagnosticErrorType(error) : null)
   })
   child.unref()
 }
@@ -921,9 +1015,12 @@ function captureExists(memoryDir, sessionId, turn) {
  * gating failure must never lose a turn: the transcript anchor is the only
  * durable record, so reject requires an authoritative `reject` action.
  */
-function runQualityGate(memsearchCmd, body, memoryDir, logger) {
+function runQualityGate(memsearchCmd, body, memoryDir, logger, onStatus) {
   const enabled = readMemsearchConfigValue(memsearchCmd, 'quality_filter.enabled')
-  if (enabled.ok && enabled.value === 'false') return null
+  if (enabled.ok && enabled.value === 'false') {
+    onStatus?.('disabled')
+    return null
+  }
   const todayFile = join(memoryDir, `${todayStr()}.md`)
   const recentArgs = existsSync(todayFile) ? ['--recent-file', todayFile] : []
   try {
@@ -938,11 +1035,16 @@ function runQualityGate(memsearchCmd, body, memoryDir, logger) {
       },
     )
     const verdict = JSON.parse(result)
-    if (typeof verdict?.action !== 'string') return null
+    if (typeof verdict?.action !== 'string') {
+      onStatus?.('invalid-response')
+      return null
+    }
+    onStatus?.('verdict')
     return { action: verdict.action, score: Number(verdict.score) }
   } catch (error) {
     // Older memsearch without the `quality` subcommand exits non-zero here.
     logger?.warn?.(`[memsearch] quality gate unavailable (${error.message}); writing without scoring`)
+    onStatus?.('failed', diagnosticErrorType(error))
     return null
   }
 }
@@ -1290,6 +1392,13 @@ export function apply(ctx, config = {}) {
   const opts = {
     captureEnabled: config.captureEnabled !== false,
     injectEnabled: config.injectEnabled !== false,
+    diagnosticLogEnabled: config.diagnosticLogEnabled === true,
+    diagnosticLogRetentionDays: Number.isInteger(config.diagnosticLogRetentionDays) && config.diagnosticLogRetentionDays > 0
+      ? config.diagnosticLogRetentionDays
+      : DEFAULT_DIAGNOSTIC_LOG_RETENTION_DAYS,
+    diagnosticLogDrainTimeoutMs: Number.isInteger(config.diagnosticLogDrainTimeoutMs) && config.diagnosticLogDrainTimeoutMs > 0
+      ? config.diagnosticLogDrainTimeoutMs
+      : DEFAULT_DIAGNOSTIC_LOG_DRAIN_TIMEOUT_MS,
     summarizeEnabled: config.summarizeEnabled !== false,
     summarizeMode: config.summarizeMode,
     // `summarizeTimeoutMs` overrides the per-mode timeout defaults (30 s
@@ -1333,6 +1442,56 @@ export function apply(ctx, config = {}) {
   opts.agentName = DEFAULT_AGENT_NAME
   opts.milvusUri = readMemsearchConfigValue(memsearchCmd, 'milvus.uri').value || ''
   const memoryDirFor = (projectDir) => join(memsearchDirFor(projectDir), 'memory')
+  let diagnosticLogWarningEmitted = false
+  let diagnosticAccepting = true
+  let diagnosticWritesActive = true
+  let diagnosticChain = Promise.resolve()
+  const diagnosticPrunedDirs = new Set()
+  const deferredDiagnostics = new Map()
+  const diagnostic = (projectDir, event, fields = {}) => {
+    if (!opts.diagnosticLogEnabled || !diagnosticAccepting) return
+    const memsearchDir = memsearchDirFor(projectDir)
+    const item = { event, fields }
+    if (!existsSync(memsearchDir)) {
+      const deferred = deferredDiagnostics.get(memsearchDir) || []
+      deferred.push(item)
+      deferredDiagnostics.set(memsearchDir, deferred)
+      return
+    }
+    const batch = [...(deferredDiagnostics.get(memsearchDir) || []), item]
+    deferredDiagnostics.delete(memsearchDir)
+    const prune = !diagnosticPrunedDirs.has(memsearchDir)
+    diagnosticPrunedDirs.add(memsearchDir)
+    diagnosticChain = diagnosticChain.then(async () => {
+      let pruneNext = prune
+      for (const entry of batch) {
+        const result = await writeDiagnosticEvent(memsearchDir, entry.event, entry.fields, {
+          isActive: () => diagnosticWritesActive,
+          prune: pruneNext,
+          retentionDays: opts.diagnosticLogRetentionDays,
+        })
+        pruneNext = false
+        if (result !== 'failed' || diagnosticLogWarningEmitted) continue
+        diagnosticLogWarningEmitted = true
+        ctx.logger.warn('[memsearch] diagnostic log unavailable; continuing without file logging')
+      }
+    })
+  }
+  if (typeof ctx.effect === 'function') {
+    ctx.effect(() => async () => {
+      diagnosticAccepting = false
+      deferredDiagnostics.clear()
+      await new Promise((resolve) => {
+        const timer = setTimeout(resolve, opts.diagnosticLogDrainTimeoutMs)
+        timer.unref?.()
+        diagnosticChain.then(
+          () => { clearTimeout(timer); resolve() },
+          () => { clearTimeout(timer); resolve() },
+        )
+      })
+      diagnosticWritesActive = false
+    }, 'memsearch diagnostic log drain')
+  }
 
   const collectionCache = new Map()
   const compatibleCollectionCache = new Set()
@@ -1375,15 +1534,40 @@ export function apply(ctx, config = {}) {
 
       const projectDir = projectDirFor(agent.session)
       const memoryDir = memoryDirFor(projectDir)
+      // Do not create `.memsearch/` merely because diagnostics are enabled:
+      // projects without memory remain untouched.
       if (!hasMemoryFiles(memoryDir)) return decision
 
       const collection = resolveCollection(projectDir)
-      if (!collection) return decision
-      const chunks = await runSearch(memsearchCmd, question, collection, projectDir, opts.milvusUri)
-      if (!chunks || chunks.length === 0) return decision
+      if (!collection) {
+        diagnostic(projectDir, 'recall.skipped', { turn, reason: 'no-collection' })
+        return decision
+      }
+      const searchStarted = Date.now()
+      diagnostic(projectDir, 'recall.search.started', { turn, collection })
+      const chunks = await runSearch(
+        memsearchCmd,
+        question,
+        collection,
+        projectDir,
+        opts.milvusUri,
+        (stage, errorType) => diagnostic(projectDir, 'recall.search.failed', { turn, stage, errorType }),
+      )
+      if (!chunks) return decision
+      if (chunks.length === 0) {
+        diagnostic(projectDir, 'recall.search.empty', { turn, durationMs: Date.now() - searchStarted })
+        return decision
+      }
 
       const text = renderMemoryBlock(chunks)
-      const memoryMessage = await createMemoryMessage(ctx, text)
+      let memoryMessage
+      try {
+        memoryMessage = await createMemoryMessage(ctx, text)
+      } catch (error) {
+        diagnostic(projectDir, 'recall.injection.failed', { turn, errorType: diagnosticErrorType(error) })
+        throw error
+      }
+      diagnostic(projectDir, 'recall.injected', { turn, resultCount: chunks.length, durationMs: Date.now() - searchStarted })
       return {
         kind: 'enter',
         messages: [...decision.messages, memoryMessage],
@@ -1399,30 +1583,48 @@ export function apply(ctx, config = {}) {
   // through a promise chain so LLM summarize calls never overlap, and the
   // `captureExists` dedup keeps a turn idempotent if its event replays.
   let captureChain = Promise.resolve()
-  const enqueueCapture = (work) => {
+  const enqueueCapture = (work, metadata) => {
     captureChain = captureChain
       .then(work)
-      .catch((error) => ctx.logger.warn(`[memsearch] capture failed: ${error.message}`))
+      .catch((error) => {
+        ctx.logger.warn(`[memsearch] capture failed: ${error.message}`)
+        diagnostic(metadata.projectDir, 'capture.failed', {
+          sessionId: metadata.sessionId,
+          turn: metadata.turn,
+          errorType: diagnosticErrorType(error),
+        })
+      })
   }
 
   const processTurn = async (session, turnEndEvent) => {
     const projectDir = projectDirFor(session)
-    const render = renderTurn(session, turnEndEvent)
-    if (!render) return
     const sessionId = session.id
     const turn = turnEndEvent.data.turn
+    diagnostic(projectDir, 'capture.started', { sessionId, turn })
+    const render = renderTurn(session, turnEndEvent)
+    if (!render) {
+      diagnostic(projectDir, 'capture.skipped', { sessionId, turn, reason: 'no-user-message' })
+      return
+    }
     const dbPath = sessionLogPath(ctx, session)
     const memoryDir = memoryDirFor(projectDir)
-    if (captureExists(memoryDir, sessionId, turn)) return
+    if (captureExists(memoryDir, sessionId, turn)) {
+      diagnostic(projectDir, 'capture.deduplicated', { sessionId, turn })
+      return
+    }
 
     let body = render
     if (opts.summarizeEnabled) {
+      const summarizeStarted = Date.now()
+      diagnostic(projectDir, 'capture.summary.started', { sessionId, turn, mode: opts.summarizeMode })
       try {
         const summary = await summarizeTurn(ctx, opts, render, projectDir)
         if (summary) {
           body = summary
+          diagnostic(projectDir, 'capture.summary.succeeded', { sessionId, turn, mode: opts.summarizeMode, durationMs: Date.now() - summarizeStarted })
         } else {
           ctx.logger.warn('[memsearch] summarizer returned empty output; wrote unavailable note')
+          diagnostic(projectDir, 'capture.summary.empty', { sessionId, turn, mode: opts.summarizeMode, durationMs: Date.now() - summarizeStarted })
           body = '- Memory summary unavailable: summarizer returned empty output. Use the transcript anchor for progressive disclosure.'
         }
       } catch (error) {
@@ -1430,6 +1632,14 @@ export function apply(ctx, config = {}) {
         // daily file (summarize.py stderr can span lines).
         const reason = String(error.message).replace(/\s+/g, ' ').trim()
         ctx.logger.warn(`[memsearch] summarization failed (${reason}); wrote ${opts.summarizeFailureOutput === 'transcript' ? 'raw transcript fallback' : 'unavailable note'}`)
+        diagnostic(projectDir, 'capture.summary.failed', {
+          sessionId,
+          turn,
+          mode: opts.summarizeMode,
+          durationMs: Date.now() - summarizeStarted,
+          errorType: diagnosticErrorType(error),
+          fallback: opts.summarizeFailureOutput,
+        })
         if (opts.summarizeFailureOutput === 'transcript') {
           // Preserve the turn content instead of dropping it: the render is
           // already capped by CAPTURE_MAX_CHARS. The header deliberately
@@ -1446,8 +1656,14 @@ export function apply(ctx, config = {}) {
     // anchor in the session log keeps the raw turn reachable — and degrade
     // records the score in the section anchor.
     let quality
-    const verdict = runQualityGate(memsearchCmd, body, memoryDir, ctx.logger)
+    let qualityStatus = 'unavailable'
+    let qualityErrorType
+    const verdict = runQualityGate(memsearchCmd, body, memoryDir, ctx.logger, (status, errorType) => {
+      qualityStatus = status
+      qualityErrorType = errorType
+    })
     if (verdict) {
+      diagnostic(projectDir, 'capture.quality', { sessionId, turn, action: verdict.action, score: verdict.score })
       if (verdict.action === 'reject') {
         ctx.logger.warn(
           `[memsearch] quality gate rejected turn capture (score ${verdict.score}); transcript anchor retains the turn`,
@@ -1455,24 +1671,51 @@ export function apply(ctx, config = {}) {
         return
       }
       if (verdict.action === 'degrade') quality = verdict.score
+    } else {
+      diagnostic(projectDir, 'capture.quality', {
+        sessionId,
+        turn,
+        action: qualityStatus,
+        ...(qualityErrorType ? { errorType: qualityErrorType } : {}),
+      })
     }
     writeCapture(memoryDir, body, sessionId, turn, dbPath, quality)
+    diagnostic(projectDir, 'capture.written', { sessionId, turn, quality: quality ?? null })
     // Index right after the write so the memory is searchable by the next
     // session (or by this one's later turns) instead of waiting for a future
     // boot-time index. The index is idempotent via chunk_hash dedup.
     const collection = resolveCollection(projectDir)
     if (collection && hasMemoryFiles(memoryDir)) {
-      indexMemory(ctx, memsearchCmd, memoryDir, collection, projectDir, opts.milvusUri)
+      diagnostic(projectDir, 'capture.index.started', { sessionId, turn, collection })
+      indexMemory(ctx, memsearchCmd, memoryDir, collection, projectDir, opts.milvusUri, (errorType) => {
+        diagnostic(projectDir, errorType ? 'capture.index.failed' : 'capture.index.succeeded', {
+          sessionId,
+          turn,
+          collection,
+          ...(errorType ? { errorType } : {}),
+        })
+      })
     }
   }
 
   if (opts.captureEnabled) {
     ctx.on('session/event', (session, event) => {
       if (event.type !== 'turn/end') return
+      const metadata = {
+        projectDir: projectDirFor(session),
+        sessionId: session.id,
+        turn: event.data.turn,
+      }
       try {
-        enqueueCapture(() => processTurn(session, event))
+        diagnostic(metadata.projectDir, 'capture.queued', { sessionId: metadata.sessionId, turn: metadata.turn })
+        enqueueCapture(() => processTurn(session, event), metadata)
       } catch (error) {
         ctx.logger.warn(`[memsearch] capture listener failed: ${error.message}`)
+        diagnostic(metadata.projectDir, 'capture.listener.failed', {
+          sessionId: metadata.sessionId,
+          turn: metadata.turn,
+          errorType: diagnosticErrorType(error),
+        })
       }
     })
   }
@@ -1565,6 +1808,9 @@ export { runQualityGate }
 
 /** Append a captured turn to the daily memory file (shared format). */
 export { writeCapture }
+
+/** Retain only content-free metadata accepted by the diagnostic writer. */
+export { filterDiagnosticFields }
 
 /** Run one bounded MemSearch query through native argv. */
 export { runSearch }

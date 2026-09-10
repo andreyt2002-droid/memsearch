@@ -21,6 +21,12 @@
         # memsearch config / environment, mirroring the other platform plugins.
         #   captureEnabled (bool, default true)   — capture completed turns
         #   injectEnabled (bool, default true)    — inject returned memory candidates
+        #   diagnosticLogEnabled (bool, default false) — write content-free capture/
+        #                          recall events under .memsearch/logs/
+        #   diagnosticLogRetentionDays (positive integer, default 14) — retain
+        #                          this many UTC-dated diagnostic files
+        #   diagnosticLogDrainTimeoutMs (positive integer, default 2000) — max
+        #                          disposal wait for queued diagnostic writes
         #   summarizeEnabled (bool, default true) — summarize turns before writing
         #   summarizeTimeoutMs (number)          — override the per-mode timeout
         #                          (defaults: 30000 custom-llm, 120000 dsh-headless)

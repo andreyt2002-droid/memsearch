@@ -80,6 +80,9 @@ block (patch the `memsearch` row you inserted). All keys are optional.
 | --- | --- | --- | --- |
 | `captureEnabled` | bool | `true` | Capture completed turns into memory. |
 | `injectEnabled` | bool | `true` | Inject returned memory candidates before each turn's first step. |
+| `diagnosticLogEnabled` | bool | `false` | Append content-free capture and recall lifecycle events to `.memsearch/logs/dsh-events-YYYY-MM-DD.jsonl`. Logging failures never block the agent or memory capture. |
+| `diagnosticLogRetentionDays` | positive integer | `14` | Retain this many UTC-dated diagnostic files. Expired files are pruned when a project first logs during each plugin run. |
+| `diagnosticLogDrainTimeoutMs` | positive integer | `2000` | Maximum plugin-disposal wait for queued diagnostic writes. |
 | `summarizeEnabled` | bool | `true` | Summarize turns before writing (on final failure a short unavailable note is written, or the raw turn when `summarizeFailureOutput: transcript`). |
 | `summarizeMode` | string | `auto` | Summarizer backend. `auto` (default) mirrors the other platform plugins: if `[plugins.dsh.summarize] provider` is set in memsearch config, it uses `custom-llm`; otherwise `dsh-headless` (zero-config DSH agent). Explicit `dsh-headless` / `custom-llm` pin the backend. |
 | `summarizeTimeoutMs` | number | `30000` / `120000` | Summarizer timeout, overriding the per-mode default (30 s `custom-llm`, 120 s `dsh-headless` — the headless backend boots a full DSH process plus a model call). Transient failures (timeout, nonzero exit) are retried once after a 2 s backoff. |
@@ -103,6 +106,21 @@ Everything else — provider/model, Milvus, collection, memory dir — comes fro
   checkout so extras match the linked plugin, for example
   `uv --directory <memsearch-checkout> run memsearch`. Set the variable before
   starting the DSH profile.
+
+### Diagnostic event log
+
+Set `diagnosticLogEnabled: true` while investigating capture or recall behavior.
+The plugin appends JSONL records to
+`<project>/.memsearch/logs/dsh-events-YYYY-MM-DD.jsonl`. Records contain event
+names, timestamps, turn/session identifiers, durations, result counts, quality
+verdicts, and stable error categories. They never contain prompts, transcripts,
+summaries, retrieved chunks, or raw error messages. Events are serialized through
+an asynchronous writer, so file I/O does not block recall or capture. An
+unwritable log directory produces one DSH warning and otherwise fails open. The
+queue stops accepting records during plugin disposal and drains before disposal
+completes. Files outside the `diagnosticLogRetentionDays` UTC-day window are
+removed when that project first logs during a plugin run. Projects without an
+existing `.memsearch` directory are never given one only for diagnostics.
 
 ### Maintenance tasks (PROJECT.md / USER.md / skills)
 
