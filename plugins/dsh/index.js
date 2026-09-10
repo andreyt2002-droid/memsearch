@@ -1014,16 +1014,14 @@ function summarizeCustomLlm(opts, render, projectDir) {
 /**
  * Resolve the dsh CLI command for one-shot headless summarization.
  *
- * `dsh` may not be on PATH (it is a pnpm-installed workspace bin). We check
- * PATH first, then `DSH_CLI` as an explicit override, then the pnpm global
- * bin directory. Returns the command as an argv array (`[cmd, ...args]`),
- * or null when not found. The array form is required because `DSH_CLI` may
- * be an interpreter invocation (e.g. `node /path/to/bin.js`), which `spawn`
- * cannot treat as a single executable.
+ * `dsh` may not be on PATH (it is a pnpm-installed workspace bin). `DSH_CLI`
+ * is an explicit override and wins first, then executable discovery on PATH,
+ * then the pnpm global bin directory. Returns the command as an argv array
+ * (`[cmd, ...args]`), or null when not found. The array form is required
+ * because `DSH_CLI` may be an interpreter invocation (e.g.
+ * `node /path/to/bin.js`), which `spawn` cannot treat as a single executable.
  */
 function detectDshCmd() {
-  const onPath = resolveExecutable('dsh')
-  if (onPath) return [onPath]
   const fromEnv = process.env.DSH_CLI?.trim()
   if (fromEnv) {
     // Node cannot spawn Windows command-script wrappers directly (`EINVAL`),
@@ -1040,6 +1038,8 @@ function detectDshCmd() {
     }
     return fromEnv.split(/\s+/).filter(Boolean)
   }
+  const onPath = resolveExecutable('dsh')
+  if (onPath) return [onPath]
   const home = process.env.HOME || ''
   const pnpmBin = join(home, '.local', 'share', 'pnpm')
   if (existsSync(join(pnpmBin, 'dsh'))) return [join(pnpmBin, 'dsh')]

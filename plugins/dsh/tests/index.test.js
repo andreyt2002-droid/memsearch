@@ -149,7 +149,7 @@ test('detectDshCmd: DSH_CLI with trailing spaces is trimmed', () => {
 test('detectDshCmd: Windows npm wrapper resolves to the JS entrypoint', { skip: process.platform !== 'win32' }, () => {
   const prevCli = process.env.DSH_CLI
   const prevPath = process.env.PATH
-  const binDir = fs.mkdtempSync(`${os.tmpdir()}\\dsh-wrapper-`)
+  const binDir = fs.mkdtempSync(`${os.tmpdir()}/dsh-wrapper-`).replaceAll('/', '\\')
   const wrapper = `${binDir}\\dsh.cmd`
   const node = `${binDir}\\node.exe`
   const entry = `${binDir}\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js`
@@ -209,7 +209,7 @@ test('detectMemsearchCmd: MEMSEARCH_CMD overrides the installed CLI', () => {
 })
 
 test('runSearch: executes command spec with native argv', async () => {
-  const root = fs.mkdtempSync(`${os.tmpdir()}\\memsearch-native-search-`)
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-native-search-`)
   const recorder = `${root}\\recorder.cjs`
   const argvFile = `${root}\\argv.json`
   fs.writeFileSync(
@@ -238,7 +238,7 @@ test('runSearch: executes command spec with native argv', async () => {
 })
 
 test('indexMemory: starts background index with native argv', async () => {
-  const root = fs.mkdtempSync(`${os.tmpdir()}\\memsearch-native-index-`)
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-native-index-`)
   const memoryDir = `${root}\\memory with spaces`
   const recorder = `${root}\\recorder.cjs`
   const argvFile = `${root}\\argv.json`
@@ -507,7 +507,6 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
     skills: { register: () => {} },
     on: (name, fn) => { listeners[name] = fn },
   }
-  apply(ctx, { summarizeEnabled: false })
   const session = {
     id: 'session-raw-test',
     header: { cwd: projDir },
@@ -519,6 +518,14 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
     ],
   }
   try {
+    // Mask the ambient checkout CLI override (start-dsh-web.cmd) and PATH so
+    // the test does not spawn a real background index holding the temp dir.
+    // apply() resolves the CLI at registration time, so it must run masked too.
+    const prevMsCmd = process.env.MEMSEARCH_CMD
+    const prevPath = process.env.PATH
+    delete process.env.MEMSEARCH_CMD
+    process.env.PATH = '/nonexistent'
+    apply(ctx, { summarizeEnabled: false })
     // session/event fires with (session, event); capture drains asynchronously.
     await listeners['session/event'](session, { type: 'turn/end', data: { turn: 1 } })
     // captureChain runs async; wait a beat for the write to land.
@@ -529,6 +536,8 @@ test('apply: summarizeEnabled:false writes the raw transcript (no summarizer)', 
     const content = fs.readFileSync(`${memoryDir}/${files[0]}`, 'utf-8')
     assert.ok(content.includes('raw-marker-001'), 'raw transcript written when summarize disabled')
     assert.ok(content.includes('<!-- session:session-raw-test turn:1 '), 'anchor present')
+    process.env.PATH = prevPath
+    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   } finally {
     fs.rmSync(projDir, { recursive: true, force: true })
   }
@@ -548,8 +557,10 @@ test('apply: summarize failure writes unavailable note (not raw)', async () => {
   const prevCli = process.env.DSH_CLI
   const prevPath = process.env.PATH
   const prevHome = process.env.HOME
+  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
     delete process.env.DSH_CLI
+    delete process.env.MEMSEARCH_CMD
     process.env.PATH = '/nonexistent'
     process.env.HOME = '/nonexistent-home' // mask pnpm-global dsh fallback (would boot a real agent)
     apply(ctx, {})
@@ -578,6 +589,7 @@ test('apply: summarize failure writes unavailable note (not raw)', async () => {
     process.env.PATH = prevPath
     if (prevHome === undefined) delete process.env.HOME
     else process.env.HOME = prevHome
+    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
@@ -735,8 +747,10 @@ test('apply: summarize failure with summarizeFailureOutput:transcript preserves 
   const prevCli = process.env.DSH_CLI
   const prevPath = process.env.PATH
   const prevHome = process.env.HOME
+  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
     delete process.env.DSH_CLI
+    delete process.env.MEMSEARCH_CMD
     process.env.PATH = '/nonexistent'
     process.env.HOME = '/nonexistent-home'
     apply(ctx, { summarizeFailureOutput: 'transcript', summarizeRetryBackoffMs: 0 })
@@ -766,6 +780,7 @@ test('apply: summarize failure with summarizeFailureOutput:transcript preserves 
     process.env.PATH = prevPath
     if (prevHome === undefined) delete process.env.HOME
     else process.env.HOME = prevHome
+    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
@@ -781,8 +796,10 @@ test('apply: multi-project capture writes to each project memory dir', async () 
   }
   const prevCli = process.env.DSH_CLI
   const prevPath = process.env.PATH
+  const prevMsCmd = process.env.MEMSEARCH_CMD
   try {
     delete process.env.DSH_CLI
+    delete process.env.MEMSEARCH_CMD
     process.env.PATH = '/nonexistent'
     apply(ctx, { summarizeEnabled: false }) // raw writes, no CLI needed
     const mkSession = (id, cwd, marker) => ({
@@ -812,6 +829,7 @@ test('apply: multi-project capture writes to each project memory dir', async () 
     if (prevCli === undefined) delete process.env.DSH_CLI
     else process.env.DSH_CLI = prevCli
     process.env.PATH = prevPath
+    if (prevMsCmd !== undefined) process.env.MEMSEARCH_CMD = prevMsCmd
   }
 })
 
