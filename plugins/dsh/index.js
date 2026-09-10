@@ -579,11 +579,12 @@ function resolveSkillInstallTarget(memsearchCmd, projectDir) {
       const paths = JSON.parse(read.value)
       if (Array.isArray(paths) && paths.length > 0) {
         const first = String(paths[0])
-        return join(first.startsWith('/') ? first : projectDir, first)
+        return isAbsolute(first) ? first : resolve(projectDir, first)
       }
     } catch { /* fall through to the DSH default */ }
   }
-  return join(process.env.HOME || '', '.agents', 'skills')
+  const home = process.env.HOME || process.env.USERPROFILE || ''
+  return join(home, '.agents', 'skills')
 }
 
 /** Hard cap for read-file payloads (protects the browser from huge files). */

@@ -3,6 +3,7 @@ import assert from 'node:assert/strict'
 import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
+import { join, sep } from 'node:path'
 
 import { detectDshCmd, detectMemsearchCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, runQualityGate, runSearch, indexMemory, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
 
@@ -18,34 +19,42 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
   fs.mkdirSync(fakeBin, { recursive: true })
   fs.writeFileSync(`${memoryDir}/2026-09-07.md`, '# Test memory\n', 'utf-8')
   fs.writeFileSync(resultFile, JSON.stringify(searchResults), 'utf-8')
+  // Fake memsearch CLI as a plain node script so the fixture runs on Windows
+  // too (no /bin/sh shebang, no PATH/PATHEXT resolution needed): the child
+  // receives it through the explicit MEMSEARCH_CMD JSON-argv override.
+  const shim = `${fakeBin}/memsearch-fake.cjs`
   fs.writeFileSync(
-    `${fakeBin}/memsearch`,
-    '#!/bin/sh\n' +
-      'printf "%s\\n" "$*" >> "$MEMSEARCH_TEST_CALL_LOG"\n' +
-      'if [ "$MEMSEARCH_TEST_OLD_CORE" = "1" ] && echo " $* " | grep -q " --default-collection "; then\n' +
-      '  echo "Error: No such option: --default-collection" >&2\n' +
-      '  exit 2\n' +
-      'fi\n' +
-      'if [ "$1" = "config" ]; then exit 0; fi\n' +
-      'if [ "$1" = "search" ]; then\n' +
-      '  cat "$MEMSEARCH_TEST_RESULT"\n' +
-      '  exit 0\n' +
-      'fi\n' +
-      'exit 0\n',
+    shim,
+    [
+      'const fs = require("node:fs")',
+      'const args = process.argv.slice(2)',
+      'fs.appendFileSync(process.env.MEMSEARCH_TEST_CALL_LOG, args.join(" ") + "\\n")',
+      'if (process.env.MEMSEARCH_TEST_OLD_CORE === "1" && args.includes("--default-collection")) {',
+      '  process.stderr.write("Error: No such option: --default-collection\\n")',
+      '  process.exit(2)',
+      '}',
+      'if (args[0] === "config") process.exit(0)',
+      'if (args[0] === "search") {',
+      '  process.stdout.write(fs.readFileSync(process.env.MEMSEARCH_TEST_RESULT, "utf-8"))',
+      '  process.exit(0)',
+      '}',
+      'process.exit(0)',
+    ].join('\n'),
     'utf-8',
   )
-  fs.chmodSync(`${fakeBin}/memsearch`, 0o755)
-  fs.writeFileSync(
-    `${fakeBin}/bash`,
-    '#!/bin/sh\n' +
-      'PATH="$MEMSEARCH_TEST_PATH"\n' +
-      'export PATH\n' +
-      'BASH_ENV=/dev/null\n' +
-      'export BASH_ENV\n' +
-      'exec /usr/bin/bash --noprofile --norc "$@"\n',
-    'utf-8',
-  )
-  fs.chmodSync(`${fakeBin}/bash`, 0o755)
+  if (process.platform !== 'win32') {
+    fs.writeFileSync(
+      `${fakeBin}/bash`,
+      '#!/bin/sh\n' +
+        'PATH="$MEMSEARCH_TEST_PATH"\n' +
+        'export PATH\n' +
+        'BASH_ENV=/dev/null\n' +
+        'export BASH_ENV\n' +
+        'exec /usr/bin/bash --noprofile --norc "$@"\n',
+      'utf-8',
+    )
+    fs.chmodSync(`${fakeBin}/bash`, 0o755)
+  }
 
   try {
     const childSource = `
@@ -83,7 +92,8 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
       encoding: 'utf-8',
       env: {
         ...process.env,
-        PATH: `${fakeBin}:${process.env.PATH}`,
+        PATH: process.platform === 'win32' ? process.env.PATH : `${fakeBin}:${process.env.PATH}`,
+        MEMSEARCH_CMD: JSON.stringify([process.execPath, shim]),
         BASH_ENV: '/dev/null',
         MEMSEARCH_DIR: `${root}/state`,
         MEMSEARCH_PLUGIN_URL: new URL('../index.js', import.meta.url).href,
@@ -310,27 +320,31 @@ test('resolveSummarizeMode: unknown explicit mode logs a warning and treats as a
 
 test('resolveSummarizeMode: auto with configured provider selects custom-llm', () => {
   // Simulate `[plugins.dsh.summarize] provider = "x"` by pointing memsearchCmd
-  // at a shim that echoes the requested key.
-  const prevPath = process.env.PATH
+  // at a node shim that echoes the requested key (works on Windows too: no
+  // shebang, passed as an explicit argv array).
   const tmp = os.tmpdir()
-  const shimBin = `${tmp}/memsearch-config-shim-${process.pid}`
-  fs.mkdirSync(shimBin, { recursive: true })
-  const shim = `${shimBin}/memsearch`
+  const shim = `${tmp}/memsearch-config-shim-${process.pid}.cjs`
   fs.writeFileSync(
     shim,
-    `#!/bin/sh\ncase "$3" in\n  plugins.dsh.summarize.provider) echo "deepseek-zilliz" ;;\n  plugins.dsh.summarize.model) echo "deepseek-v4-flash" ;;\n  plugins.dsh.summarize.enabled) echo "true" ;;\nesac\n`,
+    [
+      'const args = process.argv.slice(2)',
+      'const key = args[args.length - 1]',
+      'const table = {',
+      '  "plugins.dsh.summarize.provider": "deepseek-zilliz",',
+      '  "plugins.dsh.summarize.model": "deepseek-v4-flash",',
+      '  "plugins.dsh.summarize.enabled": "true",',
+      '}',
+      'if (key in table) process.stdout.write(table[key] + "\\n")',
+    ].join('\n'),
     'utf-8',
   )
-  fs.chmodSync(shim, 0o755)
   try {
-    process.env.PATH = `${shimBin}:${prevPath}`
-    const r = resolveSummarizeMode('memsearch', { summarizeMode: undefined, summarizeProvider: '', summarizeModel: '' }, {})
+    const r = resolveSummarizeMode([process.execPath, shim], { summarizeMode: undefined, summarizeProvider: '', summarizeModel: '' }, {})
     assert.equal(r.mode, 'custom-llm')
     assert.equal(r.provider, 'deepseek-zilliz')
     assert.equal(r.model, 'deepseek-v4-flash')
   } finally {
-    fs.rmSync(shimBin, { recursive: true, force: true })
-    process.env.PATH = prevPath
+    fs.rmSync(shim, { force: true })
   }
 })
 
@@ -385,23 +399,26 @@ test('summarizeTurn: dsh-headless mode without CLI errors visibly', async () => 
 })
 
 test('summarizeTurn: custom-llm forwards --provider/--model to summarize.py', async () => {
-  // Point a fake `python3` (argv recorder) at the front of PATH so the spawn
+  // Point a fake python (argv recorder) at MEMSEARCH_PYTHON so the spawn
   // inside summarizeCustomLlm hits it; assert the provider/model options from
-  // plugin config reach summarize.py as CLI args.
-  const prevPath = process.env.PATH
+  // plugin config reach summarize.py as CLI args. A node recorder keeps the
+  // test cross-platform (no /bin/sh shebang).
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
-  const fakeBin = `${tmp}/memsearch-py3bin-${process.pid}`
   const argvFile = `${tmp}/memsearch-py3argv-${process.pid}.txt`
-  fs.mkdirSync(fakeBin, { recursive: true })
+  const recorder = `${tmp}/memsearch-py3bin-${process.pid}.cjs`
   fs.writeFileSync(
-    `${fakeBin}/python3`,
-    `#!/bin/sh\nprintf "%s\\n" "$@" > "${argvFile}"\ncat > /dev/null\nexit 0\n`,
+    recorder,
+    'const fs = require("node:fs")\n' +
+      'fs.writeFileSync(process.env.MEMSEARCH_TEST_ARGV, process.argv.slice(2).join("\\n") + "\\n")\n' +
+      'process.stdin.resume()\n',
     'utf-8',
   )
-  fs.chmodSync(`${fakeBin}/python3`, 0o755)
+  const prevPython = process.env.MEMSEARCH_PYTHON
+  const prevArgv = process.env.MEMSEARCH_TEST_ARGV
   try {
-    process.env.PATH = `${fakeBin}:${prevPath}`
+    process.env.MEMSEARCH_PYTHON = JSON.stringify([process.execPath, recorder])
+    process.env.MEMSEARCH_TEST_ARGV = argvFile
     const opts = {
       summarizeMode: 'custom-llm',
       agentName: 'AgentX',
@@ -413,15 +430,18 @@ test('summarizeTurn: custom-llm forwards --provider/--model to summarize.py', as
     const summary = await summarizeTurn(ctx, opts, render, process.cwd())
     assert.equal(summary, null, 'recorder exits 0 with no stdout -> null summary')
     const recorded = fs.readFileSync(argvFile, 'utf-8').trim().split('\n')
-    assert.ok(recorded[0].endsWith('scripts/summarize.py'), `first arg = summarize.py, got: ${recorded[0]}`)
+    assert.ok(recorded[0].replaceAll('\\', '/').endsWith('scripts/summarize.py'), `first arg = summarize.py, got: ${recorded[0]}`)
     const joined = recorded.join(' ')
     assert.ok(joined.includes('--provider deepseek-zilliz'), `--provider forwarded: ${joined}`)
     assert.ok(joined.includes('--model deepseek-v4-pro'), `--model forwarded: ${joined}`)
     assert.ok(joined.includes('--agent-name AgentX'), `--agent-name forwarded: ${joined}`)
   } finally {
-    try { fs.rmSync(fakeBin, { recursive: true, force: true }) } catch { /* cleanup */ }
+    try { fs.rmSync(recorder, { force: true }) } catch { /* cleanup */ }
     try { fs.unlinkSync(argvFile) } catch { /* cleanup */ }
-    process.env.PATH = prevPath
+    if (prevPython === undefined) delete process.env.MEMSEARCH_PYTHON
+    else process.env.MEMSEARCH_PYTHON = prevPython
+    if (prevArgv === undefined) delete process.env.MEMSEARCH_TEST_ARGV
+    else process.env.MEMSEARCH_TEST_ARGV = prevArgv
   }
 })
 
@@ -429,19 +449,19 @@ test('summarizeTurn: custom-llm surfaces summarize.py stderr as a visible error'
   // A failing summarize.py must reject with its stderr message (visible), not
   // silently resolve null/empty — so the caller writes the unavailable note
   // with the real reason.
-  const prevPath = process.env.PATH
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
-  const fakeBin = `${tmp}/memsearch-py3fail-${process.pid}`
-  fs.mkdirSync(fakeBin, { recursive: true })
+  const recorder = `${tmp}/memsearch-py3fail-${process.pid}.cjs`
   fs.writeFileSync(
-    `${fakeBin}/python3`,
-    '#!/bin/sh\necho "provider deepseek-zilliz not found in config" >&2\ncat > /dev/null\nexit 3\n',
+    recorder,
+    'process.stderr.write("provider deepseek-zilliz not found in config\\n")\n' +
+      'process.stdin.on("end", () => process.exit(3))\n' +
+      'process.stdin.resume()\n',
     'utf-8',
   )
-  fs.chmodSync(`${fakeBin}/python3`, 0o755)
+  const prevPython = process.env.MEMSEARCH_PYTHON
   try {
-    process.env.PATH = `${fakeBin}:${prevPath}`
+    process.env.MEMSEARCH_PYTHON = JSON.stringify([process.execPath, recorder])
     const opts = {
       summarizeMode: 'custom-llm',
       agentName: 'X',
@@ -455,8 +475,9 @@ test('summarizeTurn: custom-llm surfaces summarize.py stderr as a visible error'
       /provider deepseek-zilliz not found in config/,
     )
   } finally {
-    try { fs.rmSync(fakeBin, { recursive: true, force: true }) } catch { /* cleanup */ }
-    process.env.PATH = prevPath
+    try { fs.rmSync(recorder, { force: true }) } catch { /* cleanup */ }
+    if (prevPython === undefined) delete process.env.MEMSEARCH_PYTHON
+    else process.env.MEMSEARCH_PYTHON = prevPython
   }
 })
 
@@ -475,7 +496,7 @@ test('detectDshCmd: falls back to pnpm global bin directory', async () => {
     delete process.env.PATH
     process.env.HOME = fakeHome
     const cmd = detectDshCmd()
-    assert.deepEqual(cmd, [`${fakeHome}/.local/share/pnpm/dsh`])
+    assert.deepEqual(cmd, [join(fakeHome, '.local', 'share', 'pnpm', 'dsh')])
   } finally {
     try { fs.rmSync(fakeHome, { recursive: true, force: true }) } catch { /* cleanup */ }
     if (prevCli === undefined) delete process.env.DSH_CLI
@@ -873,16 +894,16 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   const prevDshSummarize = process.env.MEMSEARCH_DSH_SUMMARIZE
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
-  const recorder = `${tmp}/memsearch-dsh-argv-recorder-${process.pid}.sh`
+  const recorder = `${tmp}/memsearch-dsh-argv-recorder-${process.pid}.cjs`
   fs.writeFileSync(
     recorder,
-    '#!/bin/sh\nprintf "%s\\n" "$@" > "${MEMSEARCH_ARGV_FILE}"\nexit 0\n',
+    'const fs = require("node:fs")\n' +
+      'fs.writeFileSync(process.env.MEMSEARCH_ARGV_FILE, process.argv.slice(2).join("\\n") + "\\n")\n',
     'utf-8',
   )
-  fs.chmodSync(recorder, 0o755)
   const argvFile = `${tmp}/memsearch-dsh-argv-${process.pid}.txt`
   try {
-    process.env.DSH_CLI = `sh ${recorder}`
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
     process.env.MEMSEARCH_ARGV_FILE = argvFile
     const opts = {
       summarizeMode: 'dsh-headless',
@@ -1082,7 +1103,7 @@ test('memsearchDirFor: MEMSEARCH_DIR env wins (global scope)', () => {
     process.env.MEMSEARCH_DIR = '/global/memsearch'
     assert.equal(memsearchDirFor('/proj/x'), '/global/memsearch')
     delete process.env.MEMSEARCH_DIR
-    assert.equal(memsearchDirFor('/proj/x'), '/proj/x/.memsearch')
+    assert.equal(memsearchDirFor('/proj/x'), join('/proj/x', '.memsearch'))
   } finally {
     if (prev === undefined) delete process.env.MEMSEARCH_DIR
     else process.env.MEMSEARCH_DIR = prev
@@ -1247,7 +1268,8 @@ test('resolveSkillInstallTarget: paths config entry wins, relative resolves agai
   
   const target = resolveSkillInstallTarget('memsearch', '/proj')
   // No configured paths on this machine → DSH default ~/.agents/skills.
-  assert.ok(target.endsWith('/.agents/skills'), `expected ~/.agents/skills default, got ${target}`)
+  const expectedSuffix = [''].concat(['.agents', 'skills']).join(sep)
+  assert.ok(target.endsWith(expectedSuffix), `expected ~/.agents/skills default, got ${target}`)
 })
 
 test('registerSkillReviewRoutes: GET candidates returns parsed list, pending first', async () => {
@@ -1405,7 +1427,15 @@ test('registerSkillReviewRoutes: list-memsearch lists dirs/files, blocks travers
   fs.writeFileSync(`${tmp}/memory/2026-08-22.md`, '# hello')
   fs.writeFileSync(`${tmp}/config.toml`, 'x = 1')
   fs.writeFileSync(`${tmp}/.hidden`, 'no')
-  fs.symlinkSync(outside, `${tmp}/outside-link`)
+  // Dir symlinks: prefer a real symlink; on Windows fall back to a junction
+  // (junctions need no privilege) — realpath resolves both, so the escape
+  // check behaves identically.
+  let haveLink = true
+  try {
+    fs.symlinkSync(outside, `${tmp}/outside-link`)
+  } catch {
+    try { fs.symlinkSync(outside, `${tmp}/outside-link`, 'junction') } catch { haveLink = false }
+  }
   const routes = {}
   const webServer = { register: (r) => { routes[r.path] = r } }
   const ctx = { agents: { get: () => undefined }, logger: { warn: () => {} } }
@@ -1430,9 +1460,11 @@ test('registerSkillReviewRoutes: list-memsearch lists dirs/files, blocks travers
     assert.equal(res2.status, 400)
 
     // A symlink inside .memsearch must not expose an outside directory.
-    const res3 = { writeHead: (s) => { res3.status = s }, end: (b) => { res3.body = JSON.parse(b) } }
-    route.handler({ method: 'GET', url: '/memsearch-dsh/list-memsearch?path=outside-link' }, res3)
-    assert.equal(res3.status, 400)
+    if (haveLink) {
+      const res3 = { writeHead: (s) => { res3.status = s }, end: (b) => { res3.body = JSON.parse(b) } }
+      route.handler({ method: 'GET', url: '/memsearch-dsh/list-memsearch?path=outside-link' }, res3)
+      assert.equal(res3.status, 400)
+    }
   } finally {
     if (prev === undefined) delete process.env.MEMSEARCH_DIR
     else process.env.MEMSEARCH_DIR = prev
@@ -1447,7 +1479,14 @@ test('registerSkillReviewRoutes: read-file serves text, rejects binary/traversal
   fs.writeFileSync(`${tmp}/skill-candidates/foo/meta.json`, '{"name":"foo"}')
   fs.writeFileSync(`${tmp}/blob.bin`, Buffer.from([0, 1, 2, 3]))
   fs.writeFileSync(outside, 'outside secret')
-  fs.symlinkSync(outside, `${tmp}/escape.md`)
+  // File symlinks need elevated privileges on some Windows setups; when the
+  // platform refuses, skip only the symlink-escape assertion below.
+  let haveEscapeLink = true
+  try {
+    fs.symlinkSync(outside, `${tmp}/escape.md`)
+  } catch {
+    haveEscapeLink = false
+  }
   const routes = {}
   const webServer = { register: (r) => { routes[r.path] = r } }
   const ctx = { agents: { get: () => undefined }, logger: { warn: () => {} } }
@@ -1476,9 +1515,11 @@ test('registerSkillReviewRoutes: read-file serves text, rejects binary/traversal
     assert.equal(res3.status, 400)
 
     // A text-looking symlink must not expose a file outside .memsearch.
-    const res4 = { writeHead: (s) => { res4.status = s }, end: (b) => { res4.body = JSON.parse(b) } }
-    route.handler({ method: 'GET', url: '/memsearch-dsh/read-file?path=escape.md' }, res4)
-    assert.equal(res4.status, 400)
+    if (haveEscapeLink) {
+      const res4 = { writeHead: (s) => { res4.status = s }, end: (b) => { res4.body = JSON.parse(b) } }
+      route.handler({ method: 'GET', url: '/memsearch-dsh/read-file?path=escape.md' }, res4)
+      assert.equal(res4.status, 400)
+    }
   } finally {
     if (prev === undefined) delete process.env.MEMSEARCH_DIR
     else process.env.MEMSEARCH_DIR = prev
