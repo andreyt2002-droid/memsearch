@@ -4,7 +4,7 @@ import { execFileSync } from 'node:child_process'
 import fs from 'node:fs'
 import os from 'node:os'
 
-import { detectDshCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget } from '../index.js'
+import { detectDshCmd, summarizeTurn, apply, resolveSummarizeMode, renderTurn, captureExists, writeCapture, memsearchDirFor, listSkillCandidates, resolveSkillInstallTarget, sanitizeSurrogates } from '../index.js'
 
 async function withInjectionFixture(searchResults, assertion, oldCore = false) {
   const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-inject-`)
@@ -700,6 +700,16 @@ test('renderTurn: prefers session.snapshotEvents() over the legacy events array'
 test('renderTurn: returns null when neither snapshotEvents nor events is available', () => {
   assert.equal(renderTurn({}, { data: { turn: 1 } }), null)
   assert.equal(renderTurn({ snapshotEvents: () => null }, { data: { turn: 1 } }), null)
+})
+
+test('sanitizeSurrogates: lone surrogates become U+FFFD, valid pairs survive', () => {
+  const lone = '\udc98' // unpaired low surrogate from console-captured text
+  const pair = '\uD83D\uDE00' // 😀 (valid surrogate pair)
+  const out = sanitizeSurrogates(`a${lone}b${pair}c`)
+  assert.ok(!out.includes(lone), 'lone surrogate removed')
+  assert.ok(out.includes(pair), 'valid surrogate pair preserved')
+  // The result must be encodable to UTF-8 (the property child stdin requires).
+  assert.doesNotThrow(() => Buffer.from(out, 'utf-8'))
 })
 
 test('writeCapture + captureExists: writes shared format and dedups', () => {

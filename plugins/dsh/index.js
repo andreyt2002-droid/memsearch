@@ -841,6 +841,21 @@ function writeCapture(memoryDir, body, sessionId, turn, dbPath) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Replace unpaired UTF-16 surrogate code units with U+FFFD.
+ *
+ * Transcripts can carry lone surrogates (e.g. from console-captured text);
+ * they cannot be encoded to UTF-8, and writing them to a child's stdin
+ * (or passing them as an argv value on Windows) throws instead of failing
+ * over a whole captured turn.
+ */
+function sanitizeSurrogates(text) {
+  return String(text).replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '\uFFFD',
+  )
+}
+
+/**
  * Summarize one rendered turn via scripts/summarize.py — the memsearch-managed
  * `[llm.providers.*]` route (the `custom-llm` mode). Lightweight: a single
  * python process, no DSH boot. Model/provider come from memsearch config
@@ -869,7 +884,7 @@ function summarizeCustomLlm(opts, render, projectDir) {
         reject(new Error(stderr.trim() || `summarize.py exited with status ${code}`))
       }
     })
-    child.stdin.write(render)
+    child.stdin.write(sanitizeSurrogates(render))
     child.stdin.end()
     const timer = setTimeout(() => {
       try { child.kill('SIGKILL') } catch { /* already exited */ }
@@ -943,7 +958,7 @@ function summarizeHeadless(ctx, opts, render, projectDir) {
     } catch {
       systemPrompt = `You are a third-person note-taker for {{AGENT_NAME}}. Record the following transcript as 2-10 bullet points in the same language as the [User] text. Output ONLY bullet points.`.replaceAll('{{AGENT_NAME}}', opts.agentName)
     }
-    const task = `${systemPrompt}\n\nTranscript:\n${render}`
+    const task = `${systemPrompt}\n\nTranscript:\n${sanitizeSurrogates(render)}`
 
     const args = ['--profile', 'headless', task]
 
@@ -1362,6 +1377,9 @@ export { renderTurn }
 
 /** True when a session/turn anchor already exists in the memory dir. */
 export { captureExists }
+
+/** Replace unpaired UTF-16 surrogates with U+FFFD before child I/O. */
+export { sanitizeSurrogates }
 
 /** Append a captured turn to the daily memory file (shared format). */
 export { writeCapture }
