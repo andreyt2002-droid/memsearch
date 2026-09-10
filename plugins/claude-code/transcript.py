@@ -229,9 +229,8 @@ def _summarize_tool_input(name: str, tool_input: dict) -> str:
 
 
 if __name__ == "__main__":
-    import sys
-
     import argparse
+    import sys
 
     parser = argparse.ArgumentParser(
         description="View conversation turns from a Claude Code JSONL transcript."

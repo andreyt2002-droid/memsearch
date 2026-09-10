@@ -98,6 +98,7 @@ known-first-party = ["memsearch"]
 [tool.ruff.lint.per-file-ignores]
 "tests/*" = ["T20"]      # allow print in tests
 "examples/*" = ["T20"]   # allow print in examples
+"plugins/*/transcript.py" = ["T20"]  # CLI tools: print is their output
 
 [tool.coverage.run]
 source = ["memsearch"]

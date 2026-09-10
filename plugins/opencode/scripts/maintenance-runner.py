@@ -508,7 +508,7 @@ def run_native_provider(ctx, prompt: str) -> str:
         # is instructed to output only a JSON object, which we then extract.
         # DSH_CLI may be a full command line (e.g. `node /path/to/bin.js`).
         cli = os.environ.get("DSH_CLI", "dsh").strip()
-        cmd = shlex.split(cli) + ["--profile", "headless"]
+        cmd = [*shlex.split(cli), "--profile", "headless"]
         if model:
             cmd += ["--patch", f"agent-default-model={{model:{model}}}"]
         cmd.append(prompt)
