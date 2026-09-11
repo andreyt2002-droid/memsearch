@@ -763,31 +763,76 @@ function sessionLogPath(ctx, session) {
  * turn carries no genuine user message.
  */
 function renderTurn(session, turnEndEvent) {
-  const turn = turnEndEvent.data.turn
-  const events = session.events
-  const startIndex = events.findIndex(
-    (event) => event.type === 'turn/start' && event.data.turn === turn,
-  )
-  if (startIndex < 0) return null
-  const endIndex = events.findIndex(
-    (event) => event.type === 'turn/end' && event.data.turn === turn,
-  )
-  const turnEvents = endIndex > startIndex ? events.slice(startIndex + 1, endIndex) : []
+  const turn = turnEndEvent?.data?.turn
+  if (turn === undefined) return null
+  // DSH Session replaced its public `events` array with `snapshotEvents()`.
+  // Prefer its immutable projection, but treat a throwing, malformed, empty,
+  // or incomplete projection as unusable and retry the legacy events array.
+  // Once a complete snapshot turn is found, its content is authoritative.
+  let snapshot
+  if (typeof session?.snapshotEvents === 'function') {
+    try {
+      snapshot = session.snapshotEvents()
+    } catch { /* retry the legacy projection */ }
+  }
+
+  const findTurn = (events) => {
+    if (!Array.isArray(events) || events.length === 0) return null
+
+    // Prefer the exact event that triggered capture. Identity works for the
+    // legacy array; seq works for immutable projections. Otherwise the latest
+    // matching end is the safest choice when malformed input repeats a turn.
+    let endIndex = events.findIndex(
+      (event) => event === turnEndEvent
+        && event?.type === 'turn/end'
+        && event?.data?.turn === turn,
+    )
+    if (endIndex < 0 && Number.isSafeInteger(turnEndEvent?.seq)) {
+      endIndex = events.findIndex(
+        (event) => event?.seq === turnEndEvent.seq
+          && event?.type === 'turn/end'
+          && event?.data?.turn === turn,
+      )
+    }
+    if (endIndex < 0) {
+      endIndex = events.findLastIndex(
+        (event) => event?.type === 'turn/end' && event?.data?.turn === turn,
+      )
+    }
+    if (endIndex < 0) return null
+
+    let startIndex = -1
+    for (let index = endIndex - 1; index >= 0; index -= 1) {
+      const event = events[index]
+      if (event?.type === 'turn/start' && event?.data?.turn === turn) {
+        startIndex = index
+        break
+      }
+    }
+    if (startIndex < 0) return null
+    return events.slice(startIndex + 1, endIndex)
+  }
+
+  let turnEvents = findTurn(snapshot)
+  if (turnEvents === null && session?.events !== snapshot) {
+    turnEvents = findTurn(session?.events)
+  }
+  if (turnEvents === null) return null
 
   const lines = [`=== Turn ${turn} ===`]
   let hasUser = false
   for (const event of turnEvents) {
-    if (event.type === 'user/message') {
-      if (event.data.source?.kind !== 'user') continue
-      const text = textFromContent(event.data.content)
+    if (event?.type === 'user/message') {
+      if (event.data?.source?.kind !== 'user') continue
+      const text = textFromContent(event.data?.content)
       if (!text) continue
       lines.push('', `[User]: ${text}`)
       hasUser = true
-    } else if (event.type === 'assistant/message') {
-      const text = textFromContent(event.data.message?.content)
+    } else if (event?.type === 'assistant/message') {
+      const text = textFromContent(event.data?.message?.content)
       if (!text) continue
       lines.push('', `[Assistant]: ${text}`)
-    } else if (event.type === 'tool/call') {
+    } else if (event?.type === 'tool/call' && event.data?.name) {
       lines.push('', `[Tool call]: ${event.data.name}`)
     }
   }
@@ -834,6 +879,93 @@ function writeCapture(memoryDir, body, sessionId, turn, dbPath) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Replace unpaired UTF-16 surrogate code units with U+FFFD.
+ *
+ * Transcripts can carry lone surrogates (e.g. from console-captured text).
+ * Normalize them explicitly so UTF-8 streams and platform argv conversion
+ * produce the same replacement text instead of relying on implicit behavior.
+ */
+function sanitizeSurrogates(text) {
+  return String(text).replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    '\uFFFD',
+  )
+}
+
+/** Terminate a summarizer and its descendants after a timeout. */
+function killProcessTree(child) {
+  if (!child.pid) return
+  if (process.platform === 'win32') {
+    try {
+      execFileSync('taskkill', ['/pid', String(child.pid), '/t', '/f'], { stdio: 'ignore' })
+      return
+    } catch { /* fall back to the direct child */ }
+  } else {
+    try {
+      process.kill(-child.pid, 'SIGKILL')
+      return
+    } catch { /* fall back to the direct child */ }
+  }
+  try { child.kill('SIGKILL') } catch { /* already exited */ }
+}
+
+/** Collect one summarizer child exactly once, waiting for close after timeout. */
+function collectSummarizerChild(child, {
+  input,
+  timeoutMs,
+  timeoutMessage,
+  exitMessage,
+}) {
+  return new Promise((resolve, reject) => {
+    let stdout = ''
+    let stderr = ''
+    let processError = null
+    let stdinError = null
+    let timedOut = false
+
+    child.stdout?.setEncoding('utf8')
+    child.stderr?.setEncoding('utf8')
+    child.stdout?.on('data', (data) => { stdout += data })
+    child.stderr?.on('data', (data) => { stderr += data })
+    child.once('error', (error) => { processError ??= error })
+    child.stdin?.once('error', (error) => {
+      stdinError ??= error
+      killProcessTree(child)
+    })
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      killProcessTree(child)
+    }, timeoutMs)
+    timer.unref?.()
+
+    child.once('close', (code) => {
+      clearTimeout(timer)
+      if (timedOut) {
+        reject(new Error(timeoutMessage))
+      } else if (processError) {
+        reject(processError)
+      } else if (stdinError) {
+        reject(stdinError)
+      } else if (code === 0) {
+        resolve(stdout.trim() || null)
+      } else {
+        reject(new Error(stderr.trim() || `${exitMessage} ${code}`))
+      }
+    })
+
+    if (input !== undefined) {
+      try {
+        child.stdin.end(input)
+      } catch (error) {
+        stdinError = error
+        killProcessTree(child)
+      }
+    }
+  })
+}
+
+/**
  * Summarize one rendered turn via scripts/summarize.py — the memsearch-managed
  * `[llm.providers.*]` route (the `custom-llm` mode). Lightweight: a single
  * python process, no DSH boot. Model/provider come from memsearch config
@@ -841,34 +973,22 @@ function writeCapture(memoryDir, body, sessionId, turn, dbPath) {
  * `resolveSummarizeMode` into `opts.summarizeProvider` / `opts.summarizeModel`.
  */
 function summarizeCustomLlm(opts, render, projectDir) {
-  return new Promise((resolve, reject) => {
-    const args = [
-      join(PLUGIN_DIR, 'scripts', 'summarize.py'),
-      '--agent-name', opts.agentName,
-      '--project-dir', projectDir,
-    ]
-    if (opts.summarizeProvider) args.push('--provider', opts.summarizeProvider)
-    if (opts.summarizeModel) args.push('--model', opts.summarizeModel)
-    const child = spawn('python3', args, { cwd: projectDir })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (data) => { stdout += data })
-    child.stderr.on('data', (data) => { stderr += data })
-    child.on('error', reject)
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve(stdout.trim() || null)
-      } else {
-        reject(new Error(stderr.trim() || `summarize.py exited with status ${code}`))
-      }
-    })
-    child.stdin.write(render)
-    child.stdin.end()
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL') } catch { /* already exited */ }
-      reject(new Error('summarization timed out'))
-    }, SUMMARIZE_TIMEOUT_MS)
-    timer.unref?.()
+  const args = [
+    join(PLUGIN_DIR, 'scripts', 'summarize.py'),
+    '--agent-name', opts.agentName,
+    '--project-dir', projectDir,
+  ]
+  if (opts.summarizeProvider) args.push('--provider', opts.summarizeProvider)
+  if (opts.summarizeModel) args.push('--model', opts.summarizeModel)
+  const child = spawn('python3', args, {
+    cwd: projectDir,
+    detached: process.platform !== 'win32',
+  })
+  return collectSummarizerChild(child, {
+    input: sanitizeSurrogates(render),
+    timeoutMs: opts.summarizeTimeoutMs ?? SUMMARIZE_TIMEOUT_MS,
+    timeoutMessage: 'summarization timed out',
+    exitMessage: 'summarize.py exited with status',
   })
 }
 
@@ -923,12 +1043,11 @@ function detectDshCmd() {
  * gets re-captured and re-summarized in an infinite loop.
  */
 function summarizeHeadless(ctx, opts, render, projectDir) {
-  return new Promise((resolve, reject) => {
-    const dshCmd = detectDshCmd()
-    if (!dshCmd) {
-      reject(new Error('dsh CLI not found; set DSH_CLI or install dsh on PATH for summarizeMode=dsh-headless'))
-      return
-    }
+  const dshCmd = detectDshCmd()
+  if (!dshCmd) {
+    return Promise.reject(new Error('dsh CLI not found; set DSH_CLI or install dsh on PATH for summarizeMode=dsh-headless'))
+  }
+  try {
     const promptFile = join(PLUGIN_DIR, 'prompts', 'summarize.txt')
     let systemPrompt
     try {
@@ -936,34 +1055,27 @@ function summarizeHeadless(ctx, opts, render, projectDir) {
     } catch {
       systemPrompt = `You are a third-person note-taker for {{AGENT_NAME}}. Record the following transcript as 2-10 bullet points in the same language as the [User] text. Output ONLY bullet points.`.replaceAll('{{AGENT_NAME}}', opts.agentName)
     }
-    const task = `${systemPrompt}\n\nTranscript:\n${render}`
+    const task = `${systemPrompt}\n\nTranscript:\n${sanitizeSurrogates(render)}`
 
     const args = ['--profile', 'headless', task]
 
     const child = spawn(dshCmd[0], [...dshCmd.slice(1), ...args], {
       cwd: projectDir,
       env: { ...process.env, MEMSEARCH_DSH_SUMMARIZE: '1' },
+      detached: process.platform !== 'win32',
+      // The child never reads stdin: give it an immediately-closed stream so
+      // anything waiting for EOF (the dsh CLI or a wrapper script) is not left
+      // hanging on an open pipe until the timeout kills the process.
+      stdio: ['ignore', 'pipe', 'pipe'],
     })
-    let stdout = ''
-    let stderr = ''
-    child.stdout.on('data', (data) => { stdout += data })
-    child.stderr.on('data', (data) => { stderr += data })
-    child.on('error', (error) => {
-      reject(error)
+    return collectSummarizerChild(child, {
+      timeoutMs: opts.summarizeTimeoutMs ?? SUMMARIZE_TIMEOUT_MS,
+      timeoutMessage: 'dsh headless summarization timed out',
+      exitMessage: 'dsh headless summarize exited with status',
     })
-    child.on('close', (code) => {
-      if (code === 0) {
-        resolve(stdout.trim() || null)
-      } else {
-        reject(new Error(stderr.trim() || `dsh headless summarize exited with status ${code}`))
-      }
-    })
-    const timer = setTimeout(() => {
-      try { child.kill('SIGKILL') } catch { /* already exited */ }
-      reject(new Error('dsh headless summarization timed out'))
-    }, SUMMARIZE_TIMEOUT_MS)
-    timer.unref?.()
-  })
+  } catch (error) {
+    return Promise.reject(error)
+  }
 }
 
 /**
@@ -1351,6 +1463,9 @@ export { renderTurn }
 
 /** True when a session/turn anchor already exists in the memory dir. */
 export { captureExists }
+
+/** Replace unpaired UTF-16 surrogates with U+FFFD before child I/O. */
+export { sanitizeSurrogates }
 
 /** Append a captured turn to the daily memory file (shared format). */
 export { writeCapture }
