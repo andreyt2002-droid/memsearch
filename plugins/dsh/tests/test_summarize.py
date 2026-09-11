@@ -6,6 +6,8 @@ memsearch config objects — no LLM calls, no subprocesses.
 
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -16,6 +18,27 @@ SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 sys.path.insert(0, str(SCRIPTS))
 
 import summarize  # noqa: E402  (inserted above)
+
+
+def test_import_forces_utf8_stdout_and_stderr_under_legacy_code_page() -> None:
+    env = {**os.environ, "PYTHONIOENCODING": "cp1251:strict"}
+    expected_stdout = "摘要 \N{MULTIPLICATION SIGN} 😀"
+    code = (
+        "import sys; "
+        f"sys.path.insert(0, {str(SCRIPTS)!r}); "
+        "import summarize; "
+        f"print({expected_stdout!r}); "
+        "print('ошибка 中文', file=sys.stderr)"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr.decode("utf-8", errors="replace")
+    assert result.stdout.decode("utf-8").strip() == expected_stdout
+    assert result.stderr.decode("utf-8").strip() == "ошибка 中文"
 
 
 def _provider(type_: str, model: str = "", base_url: str = "", api_key: str = "") -> SimpleNamespace:
@@ -30,9 +53,7 @@ def make_config(**overrides) -> SimpleNamespace:
     llm = SimpleNamespace(provider="", model="", base_url="", api_key="", providers=providers)
     compact = SimpleNamespace(llm_provider="", llm_model="", base_url="", api_key="")
     prompts = SimpleNamespace(summarize="")
-    plugins = SimpleNamespace(
-        dsh=SimpleNamespace(summarize=SimpleNamespace(enabled=True, provider="", model=""))
-    )
+    plugins = SimpleNamespace(dsh=SimpleNamespace(summarize=SimpleNamespace(enabled=True, provider="", model="")))
     config = SimpleNamespace(llm=llm, compact=compact, prompts=prompts, plugins=plugins)
     return config
 

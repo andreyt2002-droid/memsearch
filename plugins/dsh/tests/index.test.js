@@ -360,6 +360,62 @@ test('summarizeTurn: custom-llm surfaces summarize.py stderr as a visible error'
   }
 })
 
+test('summarizeTurn: custom-llm normalizes stdin and preserves split UTF-8 stdout', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-custom-unicode-`)
+  const fakeBin = `${root}/bin`
+  const recorder = `${root}/recorder.mjs`
+  const stdinFile = `${root}/stdin.txt`
+  const prevPath = process.env.PATH
+  fs.mkdirSync(fakeBin)
+  fs.writeFileSync(
+    recorder,
+    'import { writeFileSync } from "node:fs";\n' +
+      'let input = "";\n' +
+      'process.stdin.setEncoding("utf8");\n' +
+      'process.stdin.on("data", (chunk) => { input += chunk; });\n' +
+      `process.stdin.on("end", () => { writeFileSync(${JSON.stringify(stdinFile)}, input, "utf8"); const bytes = Buffer.from("总结 × 😀", "utf8"); process.stdout.write(bytes.subarray(0, 2)); setImmediate(() => { process.stdout.write(bytes.subarray(2)); process.exit(0); }); });\n`,
+    'utf-8',
+  )
+  fs.writeFileSync(
+    `${fakeBin}/python3`,
+    `#!/bin/sh\nexec ${JSON.stringify(process.execPath)} ${JSON.stringify(recorder)}\n`,
+    'utf-8',
+  )
+  fs.chmodSync(`${fakeBin}/python3`, 0o755)
+  try {
+    process.env.PATH = `${fakeBin}:/usr/bin:/bin`
+    const opts = { summarizeMode: 'custom-llm', agentName: 'X' }
+    const ctx = { logger: { warn: () => {} } }
+    const summary = await summarizeTurn(ctx, opts, `low:\udc98 pair:😀`, process.cwd())
+    assert.equal(summary, '总结 × 😀')
+    assert.equal(fs.readFileSync(stdinFile, 'utf-8'), 'low:� pair:😀')
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    process.env.PATH = prevPath
+  }
+})
+
+test('summarizeTurn: custom-llm rejects an early stdin close', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-custom-epipe-`)
+  const fakeBin = `${root}/bin`
+  const prevPath = process.env.PATH
+  fs.mkdirSync(fakeBin)
+  fs.writeFileSync(`${fakeBin}/python3`, '#!/bin/sh\nexit 0\n', 'utf-8')
+  fs.chmodSync(`${fakeBin}/python3`, 0o755)
+  try {
+    process.env.PATH = `${fakeBin}:/usr/bin:/bin`
+    const opts = { summarizeMode: 'custom-llm', agentName: 'X', summarizeTimeoutMs: 1000 }
+    const ctx = { logger: { warn: () => {} } }
+    await assert.rejects(
+      summarizeTurn(ctx, opts, 'x'.repeat(8 * 1024 * 1024), process.cwd()),
+      /EPIPE|write/i,
+    )
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    process.env.PATH = prevPath
+  }
+})
+
 test('detectDshCmd: falls back to pnpm global bin directory', async () => {
   const prevCli = process.env.DSH_CLI
   const prevPath = process.env.PATH
@@ -564,6 +620,7 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   // We point DSH_CLI at a recorder script that writes its argv to a file, then
   // assert the recorded args contain no `--patch` (and no temp overlay path).
   const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
   const prevDshSummarize = process.env.MEMSEARCH_DSH_SUMMARIZE
   const tmp = await import('node:os').then((os) => os.tmpdir())
   const fs = await import('node:fs')
@@ -577,6 +634,7 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
   const argvFile = `${tmp}/memsearch-dsh-argv-${process.pid}.txt`
   try {
     process.env.DSH_CLI = `sh ${recorder}`
+    process.env.PATH = '/usr/bin:/bin'
     process.env.MEMSEARCH_ARGV_FILE = argvFile
     const opts = {
       summarizeMode: 'dsh-headless',
@@ -603,6 +661,7 @@ test('summarizeHeadless: does not build a --patch overlay for the model', async 
     delete process.env.MEMSEARCH_ARGV_FILE
     if (prevCli === undefined) delete process.env.DSH_CLI
     else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
     if (prevDshSummarize === undefined) delete process.env.MEMSEARCH_DSH_SUMMARIZE
     else process.env.MEMSEARCH_DSH_SUMMARIZE = prevDshSummarize
   }
@@ -614,6 +673,7 @@ test('summarizeHeadless: child receives EOF on stdin and does not hang', async (
   // until the summarize timeout kills it. Point DSH_CLI at a Node recorder
   // that exits only after stdin ends, then assert it completed promptly.
   const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
   const prevDshSummarize = process.env.MEMSEARCH_DSH_SUMMARIZE
   const tmp = os.tmpdir()
   const recorder = `${tmp}/memsearch-dsh-stdin-eof-${process.pid}.mjs`
@@ -630,6 +690,7 @@ test('summarizeHeadless: child receives EOF on stdin and does not hang', async (
     // detectDshCmd splits DSH_CLI on whitespace; quote the interpreter path is
     // not needed because process.execPath and tmpdir contain no spaces here.
     process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    process.env.PATH = '/usr/bin:/bin'
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X' }
     const ctx = { logger: { warn: () => {} } }
     const render = '=== Turn 1 ===\n\n[User]: hi\n\n[Assistant]: hello'
@@ -644,8 +705,94 @@ test('summarizeHeadless: child receives EOF on stdin and does not hang', async (
     try { fs.unlinkSync(markerFile) } catch { /* cleanup */ }
     if (prevCli === undefined) delete process.env.DSH_CLI
     else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
     if (prevDshSummarize === undefined) delete process.env.MEMSEARCH_DSH_SUMMARIZE
     else process.env.MEMSEARCH_DSH_SUMMARIZE = prevDshSummarize
+  }
+})
+
+test('summarizeHeadless: preserves split UTF-8 stdout and Unicode stderr', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-child-unicode-`)
+  const recorder = `${root}/recorder.mjs`
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  fs.writeFileSync(
+    recorder,
+    'const mode = process.env.MEMSEARCH_TEST_CHILD_MODE;\n' +
+      'const bytes = Buffer.from(mode === "ok" ? "摘要 × 😀" : "ошибка 中文", "utf8");\n' +
+      'const stream = mode === "ok" ? process.stdout : process.stderr;\n' +
+      'stream.write(bytes.subarray(0, 2));\n' +
+      'setImmediate(() => { stream.write(bytes.subarray(2)); process.exit(mode === "ok" ? 0 : 7); });\n',
+    'utf-8',
+  )
+  try {
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    process.env.PATH = '/usr/bin:/bin'
+    const opts = { summarizeMode: 'dsh-headless', agentName: 'X' }
+    const ctx = { logger: { warn: () => {} } }
+    process.env.MEMSEARCH_TEST_CHILD_MODE = 'ok'
+    assert.equal(await summarizeTurn(ctx, opts, 'render', process.cwd()), '摘要 × 😀')
+    process.env.MEMSEARCH_TEST_CHILD_MODE = 'fail'
+    await assert.rejects(summarizeTurn(ctx, opts, 'render', process.cwd()), /ошибка 中文/)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    delete process.env.MEMSEARCH_TEST_CHILD_MODE
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
+  }
+})
+
+test('summarizeHeadless: timeout reaps the child process group before rejecting', async () => {
+  const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-child-timeout-`)
+  const recorder = `${root}/recorder.mjs`
+  const pidFile = `${root}/pids.json`
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  fs.writeFileSync(
+    recorder,
+    'import { spawn } from "node:child_process";\n' +
+      'import { writeFileSync } from "node:fs";\n' +
+      'const descendant = spawn(process.execPath, ["--eval", "setInterval(() => {}, 1000)"], { stdio: "ignore" });\n' +
+      `writeFileSync(${JSON.stringify(pidFile)}, JSON.stringify([process.pid, descendant.pid]));\n` +
+      'setInterval(() => {}, 1000);\n',
+    'utf-8',
+  )
+  const isAlive = (pid) => {
+    try { process.kill(pid, 0); return true } catch { return false }
+  }
+  try {
+    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    process.env.PATH = '/usr/bin:/bin'
+    const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeTimeoutMs: 200 }
+    const ctx = { logger: { warn: () => {} } }
+    await assert.rejects(summarizeTurn(ctx, opts, 'render', process.cwd()), /timed out/)
+    const pids = JSON.parse(fs.readFileSync(pidFile, 'utf-8'))
+    for (let attempt = 0; attempt < 40 && pids.some(isAlive); attempt += 1) {
+      await new Promise((resolve) => setTimeout(resolve, 25))
+    }
+    assert.ok(pids.every((pid) => !isAlive(pid)), `no residual processes: ${JSON.stringify(pids)}`)
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true })
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
+  }
+})
+
+test('summarizeHeadless: spawn errors reject without a timeout race', async () => {
+  const prevCli = process.env.DSH_CLI
+  const prevPath = process.env.PATH
+  try {
+    process.env.DSH_CLI = '/definitely/not/a/dsh-command'
+    process.env.PATH = '/usr/bin:/bin'
+    const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeTimeoutMs: 1000 }
+    const ctx = { logger: { warn: () => {} } }
+    await assert.rejects(summarizeTurn(ctx, opts, 'render', process.cwd()), /ENOENT/)
+  } finally {
+    if (prevCli === undefined) delete process.env.DSH_CLI
+    else process.env.DSH_CLI = prevCli
+    process.env.PATH = prevPath
   }
 })
 
@@ -677,6 +824,34 @@ test('renderTurn: returns null when no user message', () => {
   assert.equal(renderTurn(session, { data: { turn: 1 } }), null)
 })
 
+test('renderTurn: snapshot and legacy event projections produce identical capture text', () => {
+  const events = [
+    { seq: 20, type: 'turn/start', data: { turn: 6 } },
+    {
+      seq: 21,
+      type: 'user/message',
+      data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'equivalence 中文 😀' }] },
+    },
+    {
+      seq: 22,
+      type: 'assistant/message',
+      data: {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'same output' }],
+        },
+      },
+    },
+    { seq: 23, type: 'turn/end', data: { turn: 6 } },
+  ]
+  const snapshotEvents = structuredClone(events)
+  const legacyEvents = structuredClone(events)
+  assert.equal(
+    renderTurn({ snapshotEvents: () => snapshotEvents }, snapshotEvents.at(-1)),
+    renderTurn({ events: legacyEvents }, legacyEvents.at(-1)),
+  )
+})
+
 test('renderTurn: prefers session.snapshotEvents() over the legacy events array', () => {
   // Newer DSH Session replaced the public `events` array with an immutable
   // snapshotEvents() projection; when both are present the snapshot wins.
@@ -700,6 +875,57 @@ test('renderTurn: prefers session.snapshotEvents() over the legacy events array'
 test('renderTurn: returns null when neither snapshotEvents nor events is available', () => {
   assert.equal(renderTurn({}, { data: { turn: 1 } }), null)
   assert.equal(renderTurn({ snapshotEvents: () => null }, { data: { turn: 1 } }), null)
+})
+
+test('renderTurn: falls back when snapshotEvents is unusable or lacks the completed turn', () => {
+  const events = [
+    { type: 'turn/start', data: { turn: 3 } },
+    { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'legacy fallback' }] } },
+    { type: 'turn/end', data: { turn: 3 } },
+  ]
+  const snapshots = [
+    () => { throw new Error('synthetic snapshot failure') },
+    () => null,
+    () => [],
+    () => [
+      { type: 'turn/start', data: { turn: 2 } },
+      { type: 'turn/end', data: { turn: 2 } },
+    ],
+  ]
+  for (const snapshotEvents of snapshots) {
+    assert.match(renderTurn({ snapshotEvents, events }, { data: { turn: 3 } }), /legacy fallback/)
+  }
+})
+
+test('renderTurn: anchors duplicate turn numbers to the emitted end event', () => {
+  const end = { seq: 5, type: 'turn/end', data: { turn: 4 } }
+  const session = {
+    snapshotEvents: () => [
+      { seq: 0, type: 'turn/start', data: { turn: 4 } },
+      { seq: 1, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'stale duplicate' }] } },
+      { seq: 2, type: 'turn/end', data: { turn: 4 } },
+      { seq: 3, type: 'turn/start', data: { turn: 4 } },
+      { seq: 4, type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'current duplicate' }] } },
+      end,
+    ],
+  }
+  const render = renderTurn(session, end)
+  assert.match(render, /current duplicate/)
+  assert.doesNotMatch(render, /stale duplicate/)
+})
+
+test('renderTurn: ignores malformed entries and an out-of-order earlier end', () => {
+  const session = {
+    snapshotEvents: () => [
+      null,
+      { type: 'turn/end', data: { turn: 8 } },
+      { type: 'turn/start', data: { turn: 8 } },
+      { type: 'user/message' },
+      { type: 'user/message', data: { source: { kind: 'user' }, content: [{ type: 'text', text: 'safe marker' }] } },
+      { type: 'turn/end', data: { turn: 8 } },
+    ],
+  }
+  assert.match(renderTurn(session, { data: { turn: 8 } }), /safe marker/)
 })
 
 test('sanitizeSurrogates: lone surrogates become U+FFFD, valid pairs survive', () => {

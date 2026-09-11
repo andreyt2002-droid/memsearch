@@ -36,7 +36,7 @@ import sys
 from pathlib import Path
 
 # The child inherits the host's console code page (e.g. cp1251 on ru-RU
-# Windows); summaries legitimately contain characters outside it (×, ≈, CJK).
+# Windows); summaries legitimately contain multiplication/approximation signs and CJK.
 # Force UTF-8 with replacement so printing the summary never crashes.
 if sys.stdout and hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
