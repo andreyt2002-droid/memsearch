@@ -827,9 +827,9 @@ test('summarizeHeadless: child receives EOF on stdin and does not hang', async (
     'utf-8',
   )
   try {
-    // detectDshCmd splits DSH_CLI on whitespace; quote the interpreter path is
-    // not needed because process.execPath and tmpdir contain no spaces here.
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    // detectDshCmd splits DSH_CLI on whitespace; quote both paths so a Node
+    // installation under e.g. "C:\Program Files\nodejs" survives the split.
+    process.env.DSH_CLI = `"${process.execPath}" "${recorder}"`
     process.env.PATH = '/usr/bin:/bin'
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X' }
     const ctx = { logger: { warn: () => {} } }
@@ -866,7 +866,8 @@ test('summarizeHeadless: preserves split UTF-8 stdout and Unicode stderr', async
     'utf-8',
   )
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    // Quote both paths: process.execPath may contain spaces (Program Files).
+    process.env.DSH_CLI = `"${process.execPath}" "${recorder}"`
     process.env.PATH = '/usr/bin:/bin'
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X' }
     const ctx = { logger: { warn: () => {} } }
@@ -902,7 +903,7 @@ test('summarizeHeadless: timeout reaps the child process group before rejecting'
     try { process.kill(pid, 0); return true } catch { return false }
   }
   try {
-    process.env.DSH_CLI = `${process.execPath} ${recorder}`
+    process.env.DSH_CLI = `"${process.execPath}" "${recorder}"`
     process.env.PATH = '/usr/bin:/bin'
     const opts = { summarizeMode: 'dsh-headless', agentName: 'X', summarizeTimeoutMs: 200 }
     const ctx = { logger: { warn: () => {} } }

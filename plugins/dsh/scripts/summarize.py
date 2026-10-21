@@ -35,6 +35,14 @@ import os
 import sys
 from pathlib import Path
 
+# Node writes the transcript as UTF-8 bytes over the pipe regardless of the
+# child's locale. On Windows ``sys.stdin`` defaults to the ANSI code page
+# (cp936 on zh-CN, cp1251 on ru-RU): decoding UTF-8 bytes that way yields
+# mojibake or lone surrogates that later ``.encode("utf-8")`` rejects.
+# Decode stdin as UTF-8 with replacement so a mixed or partially corrupt
+# transcript still summarizes instead of aborting capture for the whole turn.
+if sys.stdin and hasattr(sys.stdin, "reconfigure"):
+    sys.stdin.reconfigure(encoding="utf-8", errors="replace")
 # The child inherits the host console code page (for example cp1251 on a
 # Russian Windows installation), while model output is Unicode. Force UTF-8 so
 # valid summaries do not fail while crossing the Python-to-Node stdout pipe.
