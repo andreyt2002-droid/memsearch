@@ -74,7 +74,7 @@ test('resolveExecutable: Windows skips cmd and bat shims for direct spawn', () =
   }
 })
 
-async function withInjectionFixture(searchResults, assertion, oldCore = false) {
+async function withInjectionFixture(searchResults, assertion, oldCore = false, searchError = '') {
   const root = fs.mkdtempSync(`${os.tmpdir()}/memsearch-inject-`)
   const projectDir = `${root}/project`
   const memoryDir = `${root}/state/memory`
@@ -94,7 +94,15 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
       console.error('Error: No such option: --default-collection')
       process.exit(2)
     }
-    if (args[0] === 'search') process.stdout.write(fs.readFileSync(process.env.MEMSEARCH_TEST_RESULT))
+    if (args[0] === 'config') process.exit(0)
+    if (args[0] === 'search') {
+      if (process.env.MEMSEARCH_TEST_SEARCH_ERROR) {
+        console.error(process.env.MEMSEARCH_TEST_SEARCH_ERROR)
+        process.exit(1)
+      }
+      process.stdout.write(fs.readFileSync(process.env.MEMSEARCH_TEST_RESULT))
+      process.exit(0)
+    }
   `, 'utf-8')
 
   try {
@@ -102,8 +110,9 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
       const { apply } = await import(process.env.MEMSEARCH_PLUGIN_URL)
       const listeners = {}
       const registeredSkills = []
+      const warnings = []
       const ctx = {
-        logger: { warn: () => {}, debug: () => {} },
+        logger: { warn: (message) => warnings.push(message), debug: () => {} },
         skills: { register: (skill) => registeredSkills.push(skill) },
         on: (name, listener) => { listeners[name] = listener },
       }
@@ -126,6 +135,7 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
         unchanged: result === decision,
         result,
         error,
+        warnings,
         registeredSkillNames: registeredSkills.map((skill) => skill.name),
       }))
     `
@@ -141,6 +151,7 @@ async function withInjectionFixture(searchResults, assertion, oldCore = false) {
         MEMSEARCH_TEST_PROJECT: projectDir,
         MEMSEARCH_TEST_RESULT: resultFile,
         MEMSEARCH_TEST_OLD_CORE: oldCore ? '1' : '0',
+        MEMSEARCH_TEST_SEARCH_ERROR: searchError,
       },
     })
     await assertion({ ...JSON.parse(stdout), callLog })
@@ -1170,8 +1181,16 @@ test('apply: empty search result keeps pre-step context unchanged while recall s
   })
 })
 
-test('apply: returned chunks inject one retrieved-context marker with plugin source metadata', {
-}, async () => {
+test('apply: search failure is explicit while injection remains nonblocking', async () => {
+  await withInjectionFixture([], async ({ unchanged, warnings, registeredSkillNames }) => {
+    assert.equal(unchanged, true)
+    assert.ok(warnings.some((message) => message.includes('search failed')))
+    assert.ok(warnings.some((message) => message.includes('Collection missing')))
+    assert.ok(registeredSkillNames.includes('memory-recall'))
+  }, false, 'Collection missing')
+})
+
+test('apply: returned chunks inject one retrieved-context marker with producer-owned source metadata', async () => {
   await withInjectionFixture(
     [{ source: 'memory/2026-09-07.md:4', content: 'The release marker is PINE-NEBULA-8643.' }],
     async ({ result, unchanged, registeredSkillNames, callLog }) => {
@@ -1184,8 +1203,8 @@ test('apply: returned chunks inject one retrieved-context marker with plugin sou
       assert.equal(text.split(marker).length - 1, 1, 'exactly one retrieved-context marker')
       assert.ok(text.includes('Retrieved memory candidates from past sessions:'))
       assert.ok(text.includes('PINE-NEBULA-8643'))
-      assert.equal(injected.source.kind, 'plugin')
-      assert.equal(injected.source.plugin, 'memsearch')
+      assert.equal(injected.source.kind, 'plugin:memsearch')
+      assert.equal(injected.source.plugin, undefined, 'retired shared plugin wrapper must not be emitted')
       assert.equal(injected.source.form, 'snapshot')
       assert.equal(injected.source.sections[0].name, 'memsearch')
       assert.equal(injected.source.sections[0].text, text)

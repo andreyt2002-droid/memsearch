@@ -1,0 +1,6 @@
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-old"}}
+{"type":"event_msg","payload":{"type":"user_message","id":"user-logical-1","message":"Repeat the marker twice."}}
+{"type":"response_item","payload":{"type":"message","id":"user-logical-1","role":"user","content":[{"type":"input_text","text":"Repeat the marker twice."}]}}
+{"type":"response_item","payload":{"type":"message","id":"assistant-logical-1","role":"assistant","content":[{"type":"output_text","text":"marker marker"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","id":"assistant-logical-1","message":"marker marker"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-old"}}

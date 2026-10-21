@@ -1,0 +1,14 @@
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-before"}}
+{"type":"event_msg","payload":{"type":"user_message","message":"Ignore the previous turn."}}
+{"type":"event_msg","payload":{"type":"agent_message","message":"Previous answer."}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-before"}}
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-current"}}
+{"type":"event_msg","payload":{"type":"user_message","id":"user-logical-1","message":"same text"}}
+{"type":"response_item","payload":{"type":"message","id":"user-logical-1","role":"user","content":[{"type":"input_text","text":"same text"}]}}
+{"type":"response_item","payload":{"type":"message","id":"user-logical-2","role":"user","content":[{"type":"input_text","text":"same text"}]}}
+{"type":"event_msg","payload":{"type":"user_message","id":"user-logical-2","message":"same text"}}
+{"type":"response_item","payload":{"type":"message","id":"assistant-logical-1","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"working"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","id":"assistant-logical-1","phase":"commentary","message":"working"}}
+{"type":"response_item","payload":{"type":"message","id":"assistant-logical-2","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"done"}]}}
+{"type":"event_msg","payload":{"type":"agent_message","id":"assistant-logical-2","phase":"final_answer","message":"done"}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-current"}}

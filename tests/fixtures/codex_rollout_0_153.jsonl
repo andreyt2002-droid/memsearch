@@ -1,0 +1,9 @@
+{"type":"event_msg","payload":{"type":"task_started","turn_id":"turn-new"}}
+{"type":"response_item","payload":{"type":"message","role":"developer","content":[{"type":"input_text","text":"host policy"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"<environment_context>\n  <cwd>/fixture</cwd>\n  <shell>bash</shell>\n  <current_date>2026-09-18</current_date>\n  <timezone>UTC</timezone>\n</environment_context>"}]}}
+{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"First block."},{"type":"input_text","text":"Second block."}]}}
+{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"private reasoning"}]}}
+{"type":"response_item","payload":{"type":"function_call","name":"exec_command","call_id":"call-1","arguments":"{\"cmd\":\"printf sensitive\"}"}}
+{"type":"response_item","payload":{"type":"function_call_output","call_id":"call-1","output":"sensitive tool output"}}
+{"type":"response_item","payload":{"type":"message","role":"assistant","content":[{"type":"output_text","text":"Answer block one."},{"type":"output_text","text":"Answer block two."}]}}
+{"type":"event_msg","payload":{"type":"task_complete","turn_id":"turn-new"}}
